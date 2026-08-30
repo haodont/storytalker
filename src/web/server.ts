@@ -4,6 +4,7 @@ import { cp } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Engine, type EngineEvent } from "../engine/engine.js";
+import type { GameState } from "../facts/types.js";
 import { Store } from "../facts/store.js";
 import type { Llm } from "../llm.js";
 
@@ -50,6 +51,48 @@ export class SessionManager {
 		return id === "main" ? this.baseRoot : path.join(this.sessionsRoot, id);
 	}
 
+	/** 令牌校验：不触发任何会话启动（鉴权必须先于 get()，否则错误 token 也会唤起引擎）。
+	 *  未设置 WEB_TOKEN（token 为空串）= 关闭鉴权，打开页面即可使用 */
+	verify(token: string): boolean {
+		return !this.token || token === this.token;
+	}
+
+	/** 当前访问令牌（设置界面展示局域网访问地址用） */
+	tokenFor(): string {
+		return this.token;
+	}
+
+	/** 世界列表：直接读各世界的 current.json 元数据，不 boot 引擎（boot 会推进剧情） */
+	async listWorlds(): Promise<{ id: string; title: string; phase: string; sceneIndex: number; updatedAt: string }[]> {
+		const out: { id: string; title: string; phase: string; sceneIndex: number; updatedAt: string }[] = [];
+		for (const id of this.list()) {
+			const cur = await new Store(this.sessionRoot(id)).readJson<GameState>("存档/current.json");
+			out.push({ id, title: cur?.title ?? "", phase: cur?.phase ?? "empty", sceneIndex: cur?.sceneIndex ?? 0, updatedAt: cur?.updatedAt ?? "" });
+		}
+		return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+	}
+
+	/** 新建空白世界 */
+	async createWorld(id: string): Promise<{ ok: boolean; message?: string }> {
+		if (!SESSION_ID_RE.test(id)) return { ok: false, message: "世界名只能含字母数字_-，长度 ≤32" };
+		if (id === "main") return { ok: false, message: "世界名不能是 main" };
+		if (existsSync(this.sessionRoot(id))) return { ok: false, message: `世界「${id}」已存在` };
+		await this.get(id); // boot 空工作区（ensureWorkspace 建目录）
+		return { ok: true, message: `已创建世界「${id}」` };
+	}
+
+	/** 某个世界的存档树（直接读盘，不 boot） */
+	async savesFor(id: string): Promise<{ name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[]> {
+		const store = new Store(this.sessionRoot(id));
+		const files = await store.listDir("存档").catch(() => [] as string[]);
+		const out: { name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[] = [];
+		for (const f of files.filter((x) => x.endsWith(".json") && x !== "current.json")) {
+			const s = await store.readJson<GameState>(`存档/${f}`);
+			if (s) out.push({ name: f.replace(/\.json$/, ""), title: s.title ?? "", phase: s.phase ?? "", sceneIndex: s.sceneIndex ?? 0, updatedAt: s.updatedAt ?? "", parent: s.saveParent ?? null });
+		}
+		return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+	}
+
 	/** 获取会话（首次创建时等待进度恢复完成，避免与后续输入竞争状态） */
 	async get(id: string): Promise<WebHub> {
 		const existing = this.booting.get(id);
@@ -77,12 +120,17 @@ export class SessionManager {
 	async fork(fromId: string, newId: string, saveName: string | null): Promise<{ ok: boolean; message?: string }> {
 		if (!SESSION_ID_RE.test(newId)) return { ok: false, message: "分支名只能含字母数字_-，长度 ≤32" };
 		if (newId === "main") return { ok: false, message: "分支名不能是 main" };
+		if (saveName && !/^[\w一-鿿-]{1,64}$/.test(saveName)) return { ok: false, message: "存档名不合法" };
 		const srcRoot = this.sessionRoot(fromId);
 		const dstRoot = this.sessionRoot(newId);
 		if (this.booting.has(newId) || this.sessions.has(newId) || existsSync(dstRoot)) {
 			return { ok: false, message: `分支「${newId}」已存在` };
 		}
 		const srcHub = await this.get(fromId);
+		// 源会话正在推进剧情时复制会产生不一致快照（章稿/current.json 错位）
+		if (srcHub.engine.isBusy) {
+			return { ok: false, message: "源会话正在推进剧情（写作/校对/结算中），请稍后再分叉。" };
+		}
 		await cp(srcRoot, dstRoot, { recursive: true });
 		if (saveName) {
 			const save = await srcHub.engine.store.readJson<unknown>(`存档/${saveName}.json`);
@@ -103,13 +151,36 @@ export class WebHub {
 		readonly engine: Engine,
 		readonly token: string,
 	) {
-		// 引擎事件 → 日志 + 广播
+		// 引擎事件 → 日志 + 广播（防二次包裹：重复 new WebHub 会让事件双份入日志）
+		const marker = (engine as unknown as { __hubWrapped?: boolean }).__hubWrapped;
+		if (marker) throw new Error("该 Engine 已被 WebHub 包裹，禁止重复包裹");
+		(engine as unknown as { __hubWrapped?: boolean }).__hubWrapped = true;
 		const inner = engine.emit.bind(engine);
 		engine.emit = (ev: EngineEvent) => {
 			inner(ev);
 			this.logPush(ev);
+			void this.persistEvent(ev);
 			this.broadcast(ev);
 		};
+	}
+
+	/**
+	 * 结构性事件落盘（JSONL 追加）：流式 delta 不落——scene_done 本身带全文，
+	 * 重放完整性靠结构事件即可。服务重启后由 boot() 回填，长会话历史不再因
+	 * 内存日志 600 条截断而丢失。
+	 */
+	private static PERSISTED = new Set([
+		"phase", "status", "idea_user", "idea_done", "scene_done", "review", "boot_ready",
+		"scene_outline", "outline_updated", "choices", "arc_boundary", "ended", "error",
+	]);
+
+	private async persistEvent(ev: EngineEvent): Promise<void> {
+		if (!WebHub.PERSISTED.has(ev.type)) return;
+		try {
+			await this.engine.store.appendLine("事件日志.jsonl", JSON.stringify(ev));
+		} catch {
+			// 落盘失败不影响实时流
+		}
 	}
 
 	/**
@@ -142,6 +213,18 @@ export class WebHub {
 	}
 
 	async boot(): Promise<void> {
+		// 先回填落盘的历史事件（服务重启后刷新页面仍能看到开局卡与早期场景），再恢复引擎进度
+		const persisted = await this.engine.store.readText("事件日志.jsonl");
+		if (persisted) {
+			for (const line of persisted.trim().split("\n")) {
+				try {
+					const ev = JSON.parse(line) as EngineEvent;
+					if (WebHub.PERSISTED.has(ev.type)) this.logPush(ev);
+				} catch {
+					// 忽略损坏行
+				}
+			}
+		}
 		await this.engine.boot();
 	}
 
@@ -287,14 +370,30 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 		return serveStatic(res, file, type);
 	}
 
-	const token = url.searchParams.get("token") ?? bearerOf(req);
-	if (token !== (await sessions.get("main")).token) {
+	const token = url.searchParams.get("token") ?? bearerOf(req) ?? "";
+	if (!sessions.verify(token)) {
 		return json(res, 401, { ok: false, message: "token 无效" });
 	}
 
-	// 会话路由：?session=（默认 main；非法 id 落回 main）
+	// 会话路由：?session=（默认 main；非法 id 明确报错而不是静默写主会话）
 	const sessionId = url.searchParams.get("session") ?? "main";
-	const hub = SESSION_ID_RE.test(sessionId) ? await sessions.get(sessionId) : await sessions.get("main");
+	if (!SESSION_ID_RE.test(sessionId)) {
+		return json(res, 400, { ok: false, message: `非法会话 id「${sessionId}」` });
+	}
+
+	// 只读的世界级路由：不 boot 引擎（boot 会恢复/推进剧情）
+	if (req.method === "GET" && pathname === "/api/worlds") {
+		return json(res, 200, await sessions.listWorlds());
+	}
+	if (req.method === "GET" && pathname === "/api/saves") {
+		return json(res, 200, await sessions.savesFor(sessionId));
+	}
+	if (req.method === "POST" && pathname === "/api/worlds") {
+		const body = await readJson(req);
+		return json(res, 200, await sessions.createWorld(String(body.id ?? "")));
+	}
+
+	const hub = await sessions.get(sessionId);
 
 	if (req.method === "GET" && pathname === "/api/events") {
 		return hub.handleSse(res);
@@ -305,11 +404,18 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 	if (req.method === "GET" && pathname === "/api/state") {
 		return json(res, 200, { state: hub.getState(), session: sessionId });
 	}
-	if (req.method === "GET" && pathname === "/api/saves") {
-		return json(res, 200, await hub.engine.listSaves());
-	}
 	if (req.method === "GET" && pathname === "/api/sessions") {
 		return json(res, 200, sessions.list());
+	}
+	if (req.method === "GET" && pathname === "/api/settings") {
+		// token 一并返回：设置界面展示局域网访问地址用（已过鉴权）
+		return json(res, 200, { ok: true, settings: hub.engine.settings, token: sessions.tokenFor() });
+	}
+	if (req.method === "POST" && pathname === "/api/settings") {
+		const body = await readJson(req);
+		const message = await hub.engine.updateSettings(body as { scenesPerArc?: number; maxArcs?: number; webSearch?: boolean });
+		if (message) return json(res, 200, { ok: false, message });
+		return json(res, 200, { ok: true, settings: hub.engine.settings });
 	}
 	if (req.method === "POST" && pathname === "/api/input") {
 		return json(res, 200, await hub.handleInput(await readJson(req)));

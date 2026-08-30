@@ -8,7 +8,7 @@
 npm run typecheck   # tsc --noEmit，提交前必须通过（唯一静态门禁）
 npm run e2e         # mock 全流程自测（不依赖 LLM）
 npm run e2e:web     # Web 端 mock 自测
-npm run web         # Web 服务（需 WEB_TOKEN，见 .env.example）
+npm run web         # Web 服务（WEB_TOKEN 可选：不设则关闭鉴权）
 npm run dev         # 终端 TUI
 npm run tune        # Prompt 调优台（输出到 tune-out/）
 ```
@@ -41,5 +41,5 @@ deploy/            服务器部署脚本
 - **多模型并行开发**：改文件前先重读最新版本（文件可能刚被并行修改），编辑工具报 "modified since read" 时必须重新读取后再改，不得凭旧内容覆盖。
 - **存档兼容**：GameState（facts/types.ts）字段变更须考虑旧存档恢复（engine.restoreOrEmpty 的容错模式：缺字段补默认值）。
 - **事件即契约**：EngineEvent（engine.ts）是引擎→前端的唯一通道，新增事件要同步更新 server.ts 日志合并（logPush）、app.js renderEvent/renderProcess。
-- **Web 令牌**：本地固定 `WEB_TOKEN=play3456`（见运行备忘），启动服务时必须显式带该环境变量，否则随机生成。
+- **Web 令牌**：可选。不设 WEB_TOKEN = 关闭鉴权（局域网打开页面即用，默认玩法）；要限权时显式设置该环境变量即可。
 - 行尾 LF；TS 用 tab 缩进，前端 js/json 用 2 空格（.editorconfig 已定义）。
