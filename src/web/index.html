@@ -179,6 +179,8 @@
 
   .cursor::after { content: "▌"; color: var(--accent); animation: blink 1s step-start infinite; }
   @keyframes blink { 50% { opacity: 0; } }
+  /* 自定义元素默认 inline，卡片背景会沿文字行碎成气泡，必须显式块级 */
+  x-markdown { display: block; }
 
   /* =====================================================================
      6. 空状态欢迎页 —— 一句灵感开始

@@ -416,12 +416,26 @@ function renderSceneOutlineCard(view) {
   h.className = "outline-h";
   h.textContent = "本场大纲" + (state.lastSceneOutline ? " · 第 " + state.lastSceneOutline.scene + " 场" : "");
   sec.appendChild(h);
-  const md = document.createElement("x-markdown");
-  md.className = "outline-scene";
-  md.textContent = state.lastSceneOutline ? "" : "（尚未推演）";
-  if (state.lastSceneOutline) md.src = state.lastSceneOutline.text;
-  sec.appendChild(md);
+  if (state.lastSceneOutline) {
+    const md = document.createElement("x-markdown");
+    md.className = "outline-scene";
+    md.src = state.lastSceneOutline.text;
+    sec.appendChild(md);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "outline-meta";
+    empty.textContent = "尚未推演";
+    sec.appendChild(empty);
+  }
   view.appendChild(sec);
+}
+
+// 旧版引擎写入的系统样板不进任何视图：弧 md 的「拍子不预排」引用气泡、总纲的英文 Premise 标题
+function cleanOutlineMd(s) {
+  return String(s || "")
+    .replace(/^>[ \t]*拍子不预排[^\n]*\n?/m, "")
+    .replace(/^(#{1,6})[ \t]*(?:Premise|故事 premise)[ \t]*$/m, "$1 故事梗概")
+    .trim();
 }
 
 async function refreshOutline() {
@@ -433,11 +447,6 @@ async function refreshOutline() {
     api("/api/file?path=" + encodeURIComponent("大纲/弧-01.md") + "&token=" + encodeURIComponent(TOKEN)),
   ]).catch(() => [null, null]);
   if (activeTab !== "outline") return; // 期间切走了
-  // 旧版引擎写入的系统样板不进记录视图：弧 md 的「拍子不预排」引用气泡、总纲的英文 Premise 标题
-  const clean = (s) => String(s || "")
-    .replace(/^>[ \t]*拍子不预排[^\n]*\n?/m, "")
-    .replace(/^(#{1,6})[ \t]*(?:Premise|故事 premise)[ \t]*$/m, "$1 故事梗概")
-    .trim();
   view.replaceChildren();
   const mk = (title, content) => {
     const sec = document.createElement("div");
@@ -446,14 +455,20 @@ async function refreshOutline() {
     h.className = "outline-h";
     h.textContent = title;
     sec.appendChild(h);
-    const md = document.createElement("x-markdown");
-    if (content) md.src = content;
-    else md.textContent = "（尚未生成）";
-    sec.appendChild(md);
+    if (content) {
+      const md = document.createElement("x-markdown");
+      md.src = content;
+      sec.appendChild(md);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "outline-meta";
+      empty.textContent = "尚未生成";
+      sec.appendChild(empty);
+    }
     return sec;
   };
-  view.appendChild(mk("总纲", zong && zong.ok !== false ? clean(zong.content) : null));
-  view.appendChild(mk("当前弧 · 第 " + (state.arcCount || 1) + " 弧", arc && arc.ok !== false ? clean(arc.content) : null));
+  view.appendChild(mk("总纲", zong && zong.ok !== false ? cleanOutlineMd(zong.content) : null));
+  view.appendChild(mk("当前弧 · 第 " + (state.arcCount || 1) + " 弧", arc && arc.ok !== false ? cleanOutlineMd(arc.content) : null));
   renderSceneOutlineCard(view);
 }
 
@@ -573,11 +588,11 @@ $("menuBtn").onclick = () => { buildMenu(); menuEl.toggle(); };
 async function showFile(rel) {
   const r = await api("/api/file?path=" + encodeURIComponent(rel) + "&token=" + encodeURIComponent(TOKEN));
   if (!r || r.ok === false) { toastsEl.show((r && r.message) || "读取失败", "err"); return; }
+  if (!r.content) { newBlock("note", "「" + rel + "」尚未生成"); return; }
   const card = mountBlock(document.createElement("x-markdown"));
-  if (!r.content) { card.textContent = "（尚未生成）"; return; }
   if (/\.jsonl?$/.test(rel)) card.code = r.content.split("\n").filter((l) => l.trim())
     .map((l) => { try { return JSON.stringify(JSON.parse(l), null, 2); } catch (e) { return l; } }).join("\n\n");
-  else card.src = r.content;
+  else card.src = /\.md$/.test(rel) ? cleanOutlineMd(r.content) : r.content;
 }
 
 // ---------- 启动：拉状态 + 建 SSE ----------
