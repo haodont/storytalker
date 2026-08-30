@@ -25,6 +25,22 @@ const WRITER_VARIANTS: { name: string; system: string }[] = [
 		name: "v-lean-prose",
 		system: WRITER_SYSTEM + "\n- 心理描写全场景不得超过两句；信息通过动作与对话呈现，不用形容词堆砌；句长错落，连续三句等长视为违规。",
 	},
+	{
+		name: "v-sensory",
+		system: WRITER_SYSTEM + "\n- 每个场景至少落实两种非视觉感官（声音/气味/触感/温度），具体到物，不许写「空气中弥漫着…」这类套话；情绪一律不直接命名，只写身体反应与动作。",
+	},
+	{
+		name: "v-dialogue-drive",
+		system: WRITER_SYSTEM + "\n- 关键信息增量优先通过对白给出，叙述只负责动作与镜头；独白和心理活动全场景合计不超过两句；每段对白要能看出说话人身份差异（用词、句长、口癖）。",
+	},
+	{
+		name: "v-cold-open",
+		system: WRITER_SYSTEM + "\n- 第一句必须是人物动作或对白，禁止以天气、环境、时间开场；前情通过只言片语带出，不做回顾式铺垫；结尾停在钩子上。",
+	},
+	{
+		name: "v-tension-line",
+		system: WRITER_SYSTEM + "\n- 全场景维持一条可见的威胁线：每 3-4 段让威胁具体化一次（声音逼近/时限/目击者）；角色每次行动都要付出小代价；结尾钩子必须是威胁的升级而非悬念的重复。",
+	},
 ];
 
 const REVIEWER_VARIANTS: { name: string; system: string }[] = [
@@ -44,6 +60,18 @@ const REVIEWER_VARIANTS: { name: string; system: string }[] = [
 	{
 		name: "v-lens-strict",
 		system: REVIEWER_SYSTEM + "\n只按三个镜头逐项过一遍草稿：①位置镜头（先从角色状态快照抄下每个角色的位置，再核对草稿中该角色出现的首个场景；未交代移动而位置突变必须报出，不许以「可能赶路了」放行）②所知镜头（每句话的信息来源）③钱包镜头（每笔消费与余额）。镜头外的问题一律不报。",
+	},
+	{
+		name: "v-checklist-echo",
+		system: REVIEWER_SYSTEM + "\n先在 JSON 之前用纯文本输出核对清单：逐角色抄状态快照的位置与所知、列出草稿中的每笔消费与当前余额——抄完清单再给裁决 JSON。清单里对不上的条目必须出现在 issues 中。",
+	},
+	{
+		name: "v-sentence-scan",
+		system: REVIEWER_SYSTEM + "\n把草稿按句编号逐句过：每句标注「触犯：<约束名>」或「ok」，扫完全部句子后才允许给出裁决；issues 必须引用被标记句子的原文。",
+	},
+	{
+		name: "v-adversarial",
+		system: REVIEWER_SYSTEM + "\n默认这份草稿至少藏了 3 处与约束清单的矛盾（位置/所知/经济是高危区），你的任务是全部找出；每找到一处要引用原文并说明违反的约束。找不满 3 处时，逐条说明你排查过哪些约束、为何排除。",
 	},
 ];
 
