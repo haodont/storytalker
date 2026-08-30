@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#131316">
+<title>互动小说</title>
+<style>
+  /* =====================================================================
+     1. 设计令牌 —— 颜色 / 字体 / 圆角 / 阴影（纸质主题覆盖变量即可换肤）
+     ===================================================================== */
+  :root {
+    --bg: #131316; --panel: #1c1c20; --panel2: #24242a;
+    --ink: #dcd8d0; --dim: #8a867d;
+    --accent: #d9a45b; --accent-soft: rgba(217, 164, 91, .13); --accent-ink: #1a1206;
+    --line: #2b2b32; --line-strong: #3a3a44;
+    --ok: #9ec49a; --err: #d98a7a;
+    --radius: 12px; --radius-lg: 16px; --radius-sm: 8px;
+    --shadow-1: 0 8px 24px rgba(0, 0, 0, .4); --shadow-2: 0 16px 48px rgba(0, 0, 0, .55);
+    --sans: system-ui, "Microsoft YaHei", sans-serif;
+    --serif: "LXGW WenKai Screen", "Noto Serif CJK SC", "Source Han Serif SC", Georgia, "Microsoft YaHei", serif;
+    --fs: 1; /* 正文缩放（A-/A+ 调节） */
+    --header-h: 56px;
+    --measure: clamp(620px, 62vw, 900px); /* 阅读栏/底栏共用栏宽，随视口自适应 */
+    --footer-h: 150px; /* 底栏实测高度（app.js ResizeObserver 实时同步） */
+  }
+  html[data-theme="paper"] {
+    --bg: #f5f1e8; --panel: #fbf8f1; --panel2: #eee8da;
+    --ink: #3b372f; --dim: #8d8779;
+    --accent: #a66f2e; --accent-soft: rgba(166, 111, 46, .1); --accent-ink: #fffaf2;
+    --line: #ddd5c4; --line-strong: #c9bfa8;
+    --ok: #5a7d55; --err: #b05a48;
+  }
+
+  /* =====================================================================
+     2. 基础
+     ===================================================================== */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 17px/1.9 var(--serif);
+    display: flex; flex-direction: column;
+  }
+  ::selection { background: var(--accent); color: var(--accent-ink); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* =====================================================================
+     3. 头部 —— 左：品牌区（书名 + 状态），右：分组控件（视图 | 操作）
+     ===================================================================== */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px; height: var(--header-h);
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(10px); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .brand { display: flex; flex-direction: column; justify-content: center; gap: 3px; flex: 1; min-width: 0; }
+  #title { font-weight: 700; font-size: 16px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hgroups { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .hgroup { display: flex; align-items: center; gap: 6px; }
+  .hsep { width: 1px; height: 20px; background: var(--line); flex-shrink: 0; }
+  header button {
+    background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 9px;
+    padding: 6px 12px; font-size: 13px; font-family: var(--sans); cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  header button:hover { color: var(--ink); border-color: var(--line-strong); background: var(--panel2); }
+  header button.sm { padding: 6px 9px; font-size: 12px; min-width: 32px; }
+
+  /* =====================================================================
+     4. 布局 —— 阅读主列 + 过程面板（桌面右侧常驻，移动端抽屉）
+     ===================================================================== */
+  #layout { flex: 1; display: flex; min-height: 0; position: relative; }
+  main { flex: 1; overflow-y: auto; padding: 28px 20px calc(var(--footer-h) + 36px); max-width: var(--measure); margin: 0 auto; width: 100%; }
+  #process {
+    display: none; flex-direction: column; width: clamp(280px, 24vw, 360px); flex-shrink: 0; min-height: 0;
+    border-left: 1px solid var(--line); background: var(--panel);
+  }
+  #processHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+  }
+  #procTabs { display: flex; gap: 6px; }
+  .ptab {
+    background: none; border: 1px solid transparent; color: var(--dim); cursor: pointer;
+    font: 700 12px/1 var(--sans); letter-spacing: 3px; padding: 5px 11px; border-radius: 999px;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .ptab:hover { color: var(--ink); }
+  .ptab.active {
+    color: var(--accent); background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  #procClose { background: none; border: 0; color: var(--dim); font-size: 15px; cursor: pointer; }
+  x-proc-log { flex: 1; overflow-y: auto; min-height: 0; }
+  /* 大纲面板：总纲 / 当前弧 / 本场大纲 三段记录，联动引擎事件自动刷新 */
+  #outlineView { flex: 1; overflow-y: auto; min-height: 0; padding: 12px 14px 20px; display: none; }
+  #outlineView.active { display: block; }
+  .outline-sec { margin-bottom: 16px; }
+  .outline-h {
+    display: flex; align-items: center; gap: 10px;
+    font: 700 11px/1 var(--sans); color: var(--accent); letter-spacing: 3px; margin-bottom: 8px;
+  }
+  .outline-h::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .outline-sec .card { box-shadow: none; padding: 12px 14px; margin-bottom: 0; font-size: 13.5px; line-height: 1.75; }
+  .outline-sec .md h1 { font-size: 16px; } .outline-sec .md h2 { font-size: 14.5px; } .outline-sec .md h3 { font-size: 13.5px; }
+  .outline-meta { color: var(--dim); font: 12px/1.6 var(--sans); margin-top: 6px; }
+  @media (min-width: 980px) {
+    #process { display: flex; }
+    #procToggle, #procClose { display: none; }
+  }
+  @media (max-width: 979px) {
+    #process.open {
+      display: flex; position: fixed; top: calc(var(--header-h) + 4px); right: 0; bottom: 150px; z-index: 8;
+      width: min(88vw, 340px); box-shadow: var(--shadow-2);
+      animation: slidein .18s ease-out;
+    }
+    @keyframes slidein { from { transform: translateX(30px); opacity: 0; } }
+  }
+
+  /* =====================================================================
+     5. 阅读排版 —— 正文 / 灵感对话 / 分隔 / 卡片 / Markdown
+     ===================================================================== */
+  .block { margin-bottom: 1.2em; animation: fadein .3s ease-out; font-size: calc(clamp(16px, 11px + 0.55vw, 19px) * var(--fs)); }
+  @keyframes fadein { from { opacity: 0; transform: translateY(6px); } }
+  /* 中文正文：段首缩进 + 两端对齐（对话块/卡片/分隔除外） */
+  main .block:not(.chat):not(.card):not(.sep):not(.note) { text-indent: 2em; text-align: justify; letter-spacing: .01em; }
+
+  .chat { border-left: 3px solid var(--line-strong); padding: 4px 0 2px 14px; margin-bottom: 1.5em; color: color-mix(in srgb, var(--ink) 78%, transparent); }
+  .chat.me { border-left-color: var(--accent); color: var(--ink); }
+  .chat .who { display: block; font: 700 11px/1.8 var(--sans); color: var(--dim); letter-spacing: 2px; }
+
+  /* 场景分隔线：细线渐隐 + 小字；choice 变体为强调色，end 变体居中大字距 */
+  .sep { display: flex; align-items: center; gap: 14px; color: var(--dim); font: 500 12px/1 var(--sans); letter-spacing: 3px; margin: 2.4em 0; }
+  .sep .line { flex: 1; height: 1px; background: linear-gradient(90deg, transparent, var(--line-strong)); }
+  .sep .line:last-child { background: linear-gradient(90deg, var(--line-strong), transparent); }
+  .sep.choice { color: var(--accent); letter-spacing: 4px; }
+  .sep.choice .line { background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 45%, transparent)); }
+  .sep.choice .line:last-child { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 45%, transparent), transparent); }
+  .sep.end { justify-content: center; letter-spacing: 8px; color: var(--accent); text-indent: 8px; }
+  .sep.end .line { display: none; }
+
+  .note { color: var(--dim); font-size: calc(clamp(13px, 10px + 0.35vw, 15px) * var(--fs)); margin-bottom: 1.2em; font-family: var(--sans); }
+  .note.err { color: var(--err); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg);
+    padding: clamp(16px, 1.6vw, 24px); margin-bottom: 1.6em; font-size: calc(clamp(14px, 10.5px + 0.4vw, 16px) * var(--fs)); line-height: 1.85;
+    box-shadow: var(--shadow-1);
+  }
+  .card h3 { font-size: 17px; margin-bottom: .5em; color: var(--accent); }
+  .card ul { padding-left: 1.2em; }
+
+  /* 开局设定卡：题签式排版 */
+  .boot-kicker { font: 700 11px/1 var(--sans); letter-spacing: 5px; color: var(--accent); margin-bottom: 12px; }
+  .boot-title { font-size: calc(clamp(19px, 13px + 0.75vw, 24px) * var(--fs)) !important; text-align: center; margin: .1em 0 .5em !important; color: var(--ink) !important; letter-spacing: 1px; }
+  .boot-premise { color: var(--dim); text-align: center; margin-bottom: 1.2em; }
+  .boot-label { display: flex; align-items: center; gap: 12px; font: 700 12px/1 var(--sans); color: var(--accent); letter-spacing: 2px; margin: 1.1em 0 .5em; }
+  .boot-label::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+  /* Markdown 渲染内容（marked + DOMPurify）：文件查看等 */
+  .md h1, .md h2, .md h3, .md h4 { color: var(--accent); margin: 1em 0 .4em; line-height: 1.4; }
+  .md h1:first-child, .md h2:first-child, .md h3:first-child { margin-top: 0; }
+  .md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15.5px; }
+  .md p { margin: .5em 0; }
+  .md ul, .md ol { padding-left: 1.4em; margin: .5em 0; }
+  .md blockquote { border-left: 3px solid var(--line); padding-left: 10px; color: var(--dim); margin: .6em 0; }
+  .md code { font: 13px ui-monospace, Consolas, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+  /* 代码块固定深底：github-dark 高亮在浅色主题下也可读 */
+  .md pre { background: #141416; border: 1px solid #2a2a30; border-radius: var(--radius-sm); padding: 10px 12px; overflow-x: auto; margin: .6em 0; }
+  .md pre code { border: 0; background: none; padding: 0; }
+  .md pre code.hljs { background: transparent; padding: 0; }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+  .md table { border-collapse: collapse; margin: .6em 0; font-size: 14px; }
+  .md th, .md td { border: 1px solid var(--line); padding: 4px 10px; }
+  .md a { color: var(--accent); }
+
+  .cursor::after { content: "▌"; color: var(--accent); animation: blink 1s step-start infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* =====================================================================
+     6. 空状态欢迎页 —— 一句灵感开始
+     ===================================================================== */
+  .hero { text-align: center; padding: 8vh 10px 20px; animation: fadein .4s ease-out; }
+  .hero-mark {
+    width: 64px; height: 64px; margin: 0 auto 20px; border-radius: 18px;
+    background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    display: flex; align-items: center; justify-content: center; font-size: 28px; color: var(--accent);
+  }
+  .hero h2 { font-size: clamp(20px, 12px + 1vw, 26px); letter-spacing: 3px; margin-bottom: 10px; font-weight: 700; text-indent: 3px; }
+  .hero p { color: var(--dim); font-size: 14.5px; font-family: var(--sans); max-width: 430px; margin: 0 auto 28px; line-height: 1.9; text-wrap: balance; }
+  .hero-examples { display: flex; flex-direction: column; gap: 10px; max-width: 460px; margin: 0 auto; }
+  .hero-examples button {
+    text-align: left; background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+    border-radius: var(--radius); padding: 12px 16px; font-family: inherit; font-size: 15px; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .1s;
+  }
+  .hero-examples button:hover { border-color: var(--accent); background: var(--panel2); transform: translateY(-1px); }
+  .hero-examples .tag { color: var(--dim); font-size: 12px; font-family: var(--sans); display: block; margin-top: 2px; }
+
+  /* =====================================================================
+     7. 底部输入区 —— 选项 / 提示 / 输入行
+     ===================================================================== */
+  footer {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    backdrop-filter: blur(10px); border-top: 1px solid var(--line);
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+  }
+  /* 底栏 composer：直接对齐阅读栏（--main-left/--main-w 由 app.js 实测同步），
+     阅读栏在扣除右侧过程面板后的剩余区域内居中，硬算公式不可靠，故以实测为准 */
+  .composer {
+    width: var(--main-w, min(var(--measure), 100%));
+    margin-left: var(--main-left, 0px);
+  }
+  .composer > * { max-width: 100%; }
+  x-choices { margin: 0 auto 10px; display: block; }
+  .hint { display: flex; align-items: center; gap: 7px; color: var(--dim); font-size: 12px; font-family: var(--sans); margin: 0 auto 8px; }
+  .hint:empty { display: none; }
+  .hint::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+  #inputRow { display: flex; gap: 10px; margin: 0 auto; }
+  #input {
+    flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--ink);
+    border-radius: var(--radius); padding: 12px 16px; font-size: 16px; font-family: inherit; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  #input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  #send {
+    background: var(--accent); border: 0; color: var(--accent-ink); border-radius: var(--radius);
+    padding: 0 22px; font-size: 15px; font-weight: 700; font-family: var(--sans); cursor: pointer;
+    transition: filter .15s;
+  }
+  #send:hover { filter: brightness(1.08); }
+  #send:active { filter: brightness(.92); }
+
+  /* 小屏微调：收紧留白与字距 */
+  @media (max-width: 640px) {
+    main { padding: 20px 14px calc(var(--footer-h) + 28px); }
+    header { gap: 8px; padding: 0 10px; }
+    .sep { letter-spacing: 2px; }
+    .hero { padding-top: 5vh; }
+    .hero p { margin-bottom: 20px; }
+  }
+
+  /* =====================================================================
+     8. 浮层与杂项 —— 回到底部 / 滚动条
+     ===================================================================== */
+  #jumpBtn {
+    position: fixed; right: 18px; bottom: calc(var(--footer-h) + 24px); z-index: 6; display: none;
+    background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 999px;
+    padding: 9px 15px; font: 700 13px/1 var(--sans); cursor: pointer;
+    box-shadow: var(--shadow-1);
+  }
+  #jumpBtn.show { display: block; animation: rise .18s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(-4px); } }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div id="title">互动小说</div>
+    <x-status id="status"></x-status>
+  </div>
+  <div class="hgroups">
+    <div class="hgroup">
+      <button id="fontMinus" class="sm" title="减小正文字号">A-</button>
+      <button id="fontPlus" class="sm" title="增大正文字号">A+</button>
+      <button id="themeBtn" class="sm" title="切换 夜间/纸质 主题">纸</button>
+    </div>
+    <span class="hsep"></span>
+    <div class="hgroup">
+      <button id="procToggle" title="过程面板">过程</button>
+      <button id="menuBtn" title="菜单">菜单</button>
+    </div>
+  </div>
+  <x-menu id="menu"></x-menu>
+</header>
+<div id="layout">
+  <main id="reader"></main>
+  <aside id="process">
+    <div id="processHead">
+      <nav id="procTabs">
+        <button class="ptab active" data-tab="outline" title="总纲 / 弧大纲 / 本场大纲">大纲</button>
+        <button class="ptab" data-tab="process" title="角色思考与工具调用">过程</button>
+      </nav>
+      <button id="procClose">✕</button>
+    </div>
+    <div id="outlineView"></div>
+    <x-proc-log id="procLog"></x-proc-log>
+  </aside>
+</div>
+<footer>
+  <div class="composer">
+    <x-choices id="choices"></x-choices>
+    <div class="hint" id="hint"></div>
+    <div id="inputRow">
+      <input id="input" placeholder="" autocomplete="off">
+      <button id="send">发送</button>
+    </div>
+  </div>
+</footer>
+<x-toast-host id="toasts"></x-toast-host>
+<button id="jumpBtn">↓ 最新</button>
+<x-confirm id="confirm"></x-confirm>
+<!-- 开源组件（本地 vendored，无 CDN 依赖）：
+     霞鹜文楷 —— 开源正文字体；marked —— Markdown 渲染；DOMPurify —— 渲染结果净化；
+     highlight.js —— 代码高亮；dayjs —— 相对时间；canvas-confetti —— 完结庆祝 -->
+<link rel="stylesheet" href="/fonts/lxgwwenkaigbscreen.css">
+<link rel="stylesheet" href="/vendor/github-dark.min.css">
+<script src="/vendor/marked.umd.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/vendor/highlight.min.js"></script>
+<script src="/vendor/dayjs.min.js"></script>
+<script src="/vendor/dayjs-locale-zh-cn.js"></script>
+<script src="/vendor/dayjs-relativeTime.js"></script>
+<script src="/vendor/confetti.browser.js"></script>
+<script src="/components.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

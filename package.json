@@ -1,0 +1,46 @@
+{
+  "name": "ai-interactive-novel",
+  "version": "0.1.0",
+  "description": "AI 互动小说引擎（边玩边读）— 基于 pi 框架",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "spike": "tsx src/spike.ts",
+    "typecheck": "tsc --noEmit",
+    "e2e": "tsx src/e2e-mock.ts",
+    "web": "tsx src/index-web.ts",
+    "web:mock": "tsx src/index-web.ts --mock",
+    "e2e:web": "tsx src/e2e-web.ts",
+    "try:local": "tsx src/try-local.ts",
+    "tune": "tsx src/tune.ts"
+  },
+  "keywords": [
+    "interactive-fiction",
+    "ai",
+    "llm",
+    "interactive-novel"
+  ],
+  "author": "haodont",
+  "license": "ISC",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.3",
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3"
+  },
+  "devDependencies": {
+    "@highlightjs/cdn-assets": "^11.12.0",
+    "@types/node": "^26.4.0",
+    "canvas-confetti": "^1.9.4",
+    "dayjs": "^1.11.23",
+    "dompurify": "^3.4.14",
+    "dotenv": "^17.4.2",
+    "lxgw-wenkai-screen-webfont": "^1.7.0",
+    "marked": "^18.0.11",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
