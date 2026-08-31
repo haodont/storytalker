@@ -130,6 +130,12 @@ function mockMessage(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
+/** mock 裁决计数：第 1 次（大纲审核首轮）打回，其余通过 */
+let mockVerdictCalls = 0;
+
+/** 测试钩子：mock writer 收到的完整 prompt（E2E 断言上下文内容用，如"必须含上一场摘要"） */
+export const mockWriterPrompts: string[] = [];
+
 function mockStreamFn(role: RoleName): StreamFn {
 	return (model, context) => {
 		// Agent 可能以字符串或内容块数组两种形式传 user 消息，都要兼容
@@ -144,21 +150,53 @@ function mockStreamFn(role: RoleName): StreamFn {
 		// 工具结果已在上下文末尾 → 返回纯文本收尾，避免 mock 无限调用工具
 		const lastMsg = context.messages[context.messages.length - 1];
 		if (lastMsg?.role === "toolResult") {
-			const doneText = "（mock）工具调用已完成。";
-			const done = mockMessage([{ type: "text", text: doneText }]);
-			return lazyStream(
-				model,
-				async () =>
-					(async function* () {
-						yield { type: "start" as const, partial: done };
-						yield { type: "text_delta" as const, contentIndex: 0, delta: doneText, partial: done };
-						yield { type: "done" as const, reason: "stop" as const, message: done };
-					})(),
-			);
+			// 设计阶段的研究类工具结果：不收尾，落回正常分支（下一次会提交 design_story）
+			const isResearch =
+				JSON.stringify((lastMsg as { toolCallId?: string }).toolCallId ?? "").includes("mock-call-websearch") ||
+				JSON.stringify((lastMsg as { toolCallId?: string }).toolCallId ?? "").includes("mock-call-history");
+			if (!isResearch) {
+				const doneText = "（mock）工具调用已完成。";
+				const done = mockMessage([{ type: "text", text: doneText }]);
+				return lazyStream(
+					model,
+					async () =>
+						(async function* () {
+							yield { type: "start" as const, partial: done };
+							yield { type: "text_delta" as const, contentIndex: 0, delta: doneText, partial: done };
+							yield { type: "done" as const, reason: "stop" as const, message: done };
+						})(),
+				);
+			}
 		}
 
 		const iter = (async function* () {
 			if (role === "director") {
+				// 设计阶段的联网研究：首次返回 web_search + save_history_notes 调用（之后走正常设计）
+				const calledSearch = context.messages.some(
+					(m) => m.role === "assistant" && JSON.stringify((m as { content?: unknown }).content ?? "").includes("web_search"),
+				);
+				if (prompt.includes("web_search") && !calledSearch) {
+					const msg = mockMessage([
+						{
+							type: "toolCall",
+							id: "mock-call-websearch",
+							name: "web_search",
+							arguments: { query: "（mock）现代都市 工薪阶层 月均支出 物价" },
+						},
+						{
+							type: "toolCall",
+							id: "mock-call-history",
+							name: "save_history_notes",
+							arguments: {
+								title: "（mock）现代都市物价与民生",
+								content: "（mock）移动支付覆盖绝大多数消费场景；普通工薪月支出以房租为大头；外卖一餐约 20-40 元。",
+							},
+						},
+					]);
+					yield { type: "start" as const, partial: msg };
+					yield { type: "done" as const, reason: "toolUse" as const, message: msg };
+					return;
+				}
 				// 灵感对话：纯文本回复，不调用工具
 				if (prompt.includes("【灵感对话】")) {
 					const reply = "（mock）这个灵感有意思——主角是孤胆英雄还是小人物卷局？我建议把冲突落在「身份暴露的一夜」，基调偏冷。你想更爽还是更虐？";
@@ -223,6 +261,37 @@ function mockStreamFn(role: RoleName): StreamFn {
 					yield { type: "done" as const, reason: "toolUse" as const, message: msg };
 					return;
 				}
+				// 弧边界规划：第 1 弧后续弧（验证多弧续玩），第 2 弧后完结
+				if (prompt.includes("plan_next_arc")) {
+					const firstArc = /第\s*1\s*弧/.test(prompt);
+					const msg = mockMessage([
+						{
+							type: "toolCall",
+							id: "mock-call-arcplan",
+							name: "plan_next_arc",
+							arguments: firstArc
+								? { decision: "continue", title: "（mock）芯片真相", goal: "（mock）主角查明芯片来源并摆脱追杀，与神秘人做个了断。" }
+								: { decision: "finish", reason: "（mock）芯片之谜已解，与神秘人的恩怨了结，核心冲突解决。" },
+						},
+					]);
+					yield { type: "start" as const, partial: msg };
+					yield { type: "done" as const, reason: "toolUse" as const, message: msg };
+					return;
+				}
+				// 弧大纲修订（reviseArc）
+				if (prompt.includes("save_arc_revision")) {
+					const msg = mockMessage([
+						{
+							type: "toolCall",
+							id: "mock-call-arcrev",
+							name: "save_arc_revision",
+							arguments: { title: "（mock）第一弧·初遇（修订版）", goal: "（mock）主角查明芯片真相并揭开神秘人身份，增加悬疑元素" },
+						},
+					]);
+					yield { type: "start" as const, partial: msg };
+					yield { type: "done" as const, reason: "toolUse" as const, message: msg };
+					return;
+				}
 				// 导演类调用：从 prompt 中提取场景编号等关键信息，回一个结构化报告
 				const sceneMatch = prompt.match(/场景(\d+)/);
 				const scene = sceneMatch ? Number(sceneMatch[1]) : 1;
@@ -244,6 +313,7 @@ function mockStreamFn(role: RoleName): StreamFn {
 								],
 								recommendedChoice: 1,
 								transactions: [{ name: "主角", change: -80, reason: "（mock）逃离长街的打车费" }],
+							entityUpdates: [{ name: "长街", patch: { 气氛: "雨夜戒严" } }],
 							},
 						},
 					]);
@@ -260,9 +330,14 @@ function mockStreamFn(role: RoleName): StreamFn {
 								premise: "都市夜行人与神秘来客的博弈",
 								worldRules: "现代都市，低魔设定，异能罕见且隐秘。",
 								economy: {
-									currency: "信用点",
-									overview: "（mock）普通工薪月薪约 3000 信用点；黑市情报按条计价；主角是普通上班族，手头紧，存款只够两个月房租。",
+									templateId: "modern-cn",
+									currency: "元（人民币）",
+									overview: "（mock）普通工薪月薪约 6000 元；黑市情报按条计价；主角是普通上班族，手头紧，存款只够两个月房租。",
 								},
+								entities: [
+									{ name: "长街", type: "地域", description: "（mock）主角生活的老城区街道，市井气重。", state: { 气氛: "平静", 人口: 12000 } },
+									{ name: "神秘人组织", type: "势力", description: "（mock）在长街活动的幕后势力。", state: { 活跃度: 3 } },
+								],
 								attributes: ["体魄", "敏捷", "头脑", "感知", "意志", "人脉"],
 								characters: [
 									{
@@ -292,8 +367,9 @@ function mockStreamFn(role: RoleName): StreamFn {
 					yield { type: "done" as const, reason: "toolUse" as const, message: msg };
 				}
 			} else if (role === "reviewer") {
-				// 首稿必拒（验证校验-重写环），次稿通过
-				const pass = !prompt.includes("第 1 稿");
+				// 首次裁决打回（验证大纲审核-修订环），其余通过（正文校对只诊断，不打回）
+				mockVerdictCalls += 1;
+				const pass = mockVerdictCalls > 1;
 				const msg = mockMessage([
 					{
 						type: "toolCall",
@@ -307,7 +383,8 @@ function mockStreamFn(role: RoleName): StreamFn {
 				yield { type: "start" as const, partial: msg };
 				yield { type: "done" as const, reason: "toolUse" as const, message: msg };
 			} else {
-				// Writer：分批吐正文
+				// Writer：分批吐正文（收到的完整 prompt 推入测试钩子，供 E2E 断言上下文内容）
+				mockWriterPrompts.push(prompt);
 				const paragraphs = Array.from({ length: 6 }, (_, i) => MOCK_PROSE[i % MOCK_PROSE.length]);
 				const full = paragraphs.join("\n\n");
 				const chunk = 24;

@@ -4,6 +4,25 @@
 // 供人阅读的内容以 Markdown 存储（总纲、场景正文、场景摘要）。文件即唯一事实源。
 // ---------------------------------------------------------------------------
 
+/** 运行时设置（工作区级持久化，设置界面读写；引擎热加载） */
+export interface RuntimeSettings {
+	/** 每弧场景数（2-50） */
+	scenesPerArc: number;
+	/** 弧数上限（1-20），达上限强制收束 */
+	maxArcs: number;
+	/** 是否在设计阶段开放联网查证 */
+	webSearch: boolean;
+}
+
+/** 世界实体：城市/势力/机构/资源等宏观对象（区别于个人角色卡）。state 随剧情演化，数字是代码管理的事实 */
+export interface WorldEntity {
+	name: string;
+	type: "势力" | "地域" | "机构" | "资源" | "技术" | "其他";
+	description: string;
+	/** 动态状态键值（如 民心/兵力/库存/物价指数）；由导播每场申报补丁，引擎合并 */
+	state: Record<string, string | number>;
+}
+
 /** 引擎阶段（只前进，回退通过读档实现） */
 export type Phase = "empty" | "idea_chat" | "bootstrapping" | "confirm_bible" | "playing" | "arc_boundary" | "ended";
 
@@ -11,9 +30,9 @@ export type PlayMode = "auto" | "manual";
 
 /**
  * playing 阶段的子状态（持久化到 autosave，崩溃后可精确告知中断点）。
- * writing/reviewing/rewriting 中断 → 场景将重新生成；choosing 中断 → choices 事件重放。
+ * writing/reviewing 中断 → 场景将重新生成；choosing 中断 → choices 事件重放或自然延续。
  */
-export type PlayingSubstate = "outlining" | "writing" | "reviewing" | "rewriting" | "settling" | "choosing";
+export type PlayingSubstate = "outlining" | "writing" | "reviewing" | "settling" | "choosing";
 
 /** 角色当前状态快照（随剧情推进由 Director 更新） */
 export interface CharacterState {
@@ -116,6 +135,8 @@ export interface SceneReport {
 	recommendedChoice?: number;
 	/** 本场景的收支流水：引擎据此结算角色余额并写账本 */
 	transactions?: { name: string; change: number; reason: string }[];
+	/** 本场景的世界实体状态补丁（引擎合并；未登记实体丢弃） */
+	entityUpdates?: { name: string; patch: Record<string, string | number> }[];
 }
 
 /** Reviewer 裁决（通过 submit_verdict 工具提交） */
@@ -130,8 +151,10 @@ export interface StoryDesign {
 	premise: string;
 	worldRules: string;
 	/** 经济体系：代码管理的账本以此为准（currency 用于账本与校对） */
-	economy: { currency: string; overview: string };
-	/** 世界属性表（5-6 条，贴合题材；角色 stats 的合法键） */
+	economy: { currency: string; overview: string; templateId?: string };
+	/** 世界实体（城市/势力/资源等宏观对象），设计时注册，随剧情演化 */
+	entities?: WorldEntity[];
+	/** 世界属性表（4-8 条，贴合题材；角色 stats 的合法键） */
 	attributes: string[];
 	characters: { name: string; basics: string; initialState: CharacterState }[];
 	/** 弧只定目标，不预排拍子（拍子逐场推演） */
@@ -154,8 +177,6 @@ export interface GameState {
 	arcBeatIndex: number;
 	arc: ArcOutline | null;
 	arcCount: number;
-	/** 当前场景写稿-校验轮次（checkpoint 恢复用） */
-	attempt: number;
 	/** 场景定稿后的挂起选择（等待玩家/auto 决定） */
 	pendingReport: SceneReport | null;
 	/** 灵感酝酿阶段的对话记录（empty/idea_chat 阶段累积，构建后保留备查） */
@@ -166,5 +187,11 @@ export interface GameState {
 	currentOutline?: string;
 	/** 大纲审核意见（写手须吸收；随大纲一起清空） */
 	outlineNotes?: string;
+	/** 上一稿校对遗留疑义（校对只诊断不打回；带入下一场大纲推演修正，用后即清） */
+	draftIssues?: string[];
+	/** 存档结构版本：restoreOrEmpty 按此归一化旧快照 */
+	schemaVersion?: number;
+	/** 谱系：本状态来自哪个存档位（load 时记录；save 时随之写入，形成世界的存档树） */
+	saveParent?: string;
 	updatedAt: string;
 }

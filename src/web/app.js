@@ -68,6 +68,8 @@ function mountBlock(el) {
   const stick = nearBottom();
   el.classList.add("block");
   reader.appendChild(el);
+  // 长会话内存防线：阅读流上限 400 块，超限移除最老块（完整历史在服务端事件日志里）
+  while (reader.children.length > 400) reader.firstChild.remove();
   if (stick) scrollNow();
   updateJumpBtn();
   return el;
@@ -184,12 +186,15 @@ function renderEvent(ev) {
       if (!state.streaming) {
         state.streaming = newBlock();
         state.streamBuffer = "";
+        state.streamNode = document.createTextNode("");
+        state.streaming.appendChild(state.streamNode);
         state.streaming.classList.add("cursor");
       }
       {
         const stick = nearBottom();
+        // 追加式写入 text node：每个 delta 只动增量，不整块重写（避免 O(n²) reflow）
+        state.streamNode.data += ev.text;
         state.streamBuffer += ev.text;
-        state.streaming.textContent = state.streamBuffer + " ";
         setBusy(true);
         if (stick) scrollNow();
       }
@@ -506,7 +511,7 @@ function menuItems() {
     items.push(["切换 自动/手动 模式", () => command("mode:" + (lastMode === "manual" ? "auto" : "manual"))]);
   }
   items.push(["存档", async () => { await command("save:slot" + Date.now() % 1000); toastsEl.show("已存档", "ok"); }]);
-  items.push(["读档 / 分支…", () => showArchiveMenu()]);
+  items.push(["世界与存档…", () => $("worldsBtn").onclick()]);
   if (state.phase === "playing") {
     items.push(["调整大纲…", async () => {
       const feedback = await confirmEl.ask("想怎么调整当前弧的大纲？", { input: true });
@@ -524,59 +529,6 @@ function menuItems() {
   return items.map(([label, fn]) => ({ label, fn }));
 }
 
-// 读档 / 分支菜单：列出存档位与已有分支
-async function showArchiveMenu() {
-  const items = [{ label: "← 返回", fn: () => buildMenu() }];
-  try {
-    const saves = await api("/api/saves");
-    items.push({ label: "— 存档（点击读档）—", disabled: true });
-    if (saves.length === 0) items.push({ label: "（暂无存档）", disabled: true });
-    saves.forEach((s) => {
-      // 相对时间（dayjs + relativeTime + zh-cn），失败退回绝对时间
-      let when;
-      try { when = dayjs(s.updatedAt).fromNow(); } catch (e) { when = s.updatedAt; }
-      items.push({
-        label: `${s.name}｜${s.title || "未命名"} 第${s.sceneIndex}场 · ${when}`,
-        fn: async () => {
-          await api("/api/command", { cmd: "load:" + s.name });
-          location.reload();
-        },
-      });
-    });
-
-    const sess = await api("/api/sessions");
-    items.push({ label: "— 分支（点击切换）—", disabled: true });
-    sess.filter((s) => s !== SESSION).forEach((s) => {
-      items.push({
-        label: "→ 进入 " + s,
-        fn: () => {
-          const u = new URL(location.href);
-          u.searchParams.set("session", s);
-          location.href = u.toString();
-        },
-      });
-    });
-
-    items.push({
-      label: "⑂ 从当前进度分叉新分支",
-      fn: async () => {
-        const id = await confirmEl.ask("新分支名（字母数字-_）", { input: true, value: "fork-" + (Date.now() % 100000) });
-        if (!id) return;
-        const r = await command("fork:" + id);
-        if (r && r.ok) {
-          const u = new URL(location.href);
-          u.searchParams.set("session", id);
-          location.href = u.toString();
-        } else {
-          toastsEl.show(r && r.message ? r.message : "分叉失败", "err");
-        }
-      },
-    });
-  } catch (e) { /* 菜单失败静默 */ }
-  menuEl.items = items;
-  menuEl.open();
-}
-
 let lastMode = "manual";
 
 function buildMenu() {
@@ -584,6 +536,161 @@ function buildMenu() {
 }
 menuEl.anchor = $("menuBtn");
 $("menuBtn").onclick = () => { buildMenu(); menuEl.toggle(); };
+
+// ---------- 世界与存档 ----------
+const worldsDlg = $("worldsDlg");
+const worldListEl = $("worldList");
+const saveTreeEl = $("saveTree");
+let selectedWorld = SESSION;
+
+const phaseNames = { empty: "待灵感", idea_chat: "灵感酝酿", bootstrapping: "设计中", confirm_bible: "待确认", playing: "进行中", arc_boundary: "弧收束中", ended: "已完结" };
+function whenOf(t) { try { return dayjs(t).fromNow(); } catch (e) { return t || ""; } }
+
+$("worldsBtn").onclick = openWorlds;
+$("worldsClose").onclick = () => worldsDlg.close();
+$("worldCreate").onclick = async () => {
+  const id = await confirmEl.ask("新世界名（字母数字-_）", { input: true, value: "world-" + (Date.now() % 100000) });
+  if (!id) return;
+  const r = await fetch("/api/worlds", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + TOKEN }, body: JSON.stringify({ id }) }).then((x) => x.json());
+  toastsEl.show(r && r.ok ? r.message : (r && r.message) || "创建失败", r && r.ok ? "ok" : "err");
+  if (r && r.ok) { await refreshWorlds(); worldsDlg.close(); }
+};
+$("worldFork").onclick = async () => {
+  const id = await confirmEl.ask("新分支名（字母数字-_）", { input: true, value: "fork-" + (Date.now() % 100000) });
+  if (!id) return;
+  const r = await command("fork:" + id);
+  if (r && r.ok) {
+    const u = new URL(location.href);
+    u.searchParams.set("session", id);
+    location.href = u.toString();
+  } else {
+    toastsEl.show(r && r.message ? r.message : "分叉失败", "err");
+  }
+};
+
+async function openWorlds() {
+  await refreshWorlds();
+  worldsDlg.showModal();
+}
+
+async function refreshWorlds() {
+  let worlds = [];
+  try { worlds = await api("/api/worlds"); } catch (e) { /* 静默 */ }
+  worldListEl.innerHTML = "";
+  if (!Array.isArray(worlds) || worlds.length === 0) {
+    worldListEl.innerHTML = '<div class="st-empty">（暂无世界）</div>';
+    return;
+  }
+  for (const w of worlds) {
+    const row = document.createElement("div");
+    row.className = "world-row" + (w.id === SESSION ? " current" : "");
+    row.dataset.wid = w.id;
+    const info = document.createElement("div");
+    info.className = "w-info";
+    const title = document.createElement("div");
+    title.className = "w-title";
+    title.textContent = (w.title || "（未命名）") + " · " + w.id;
+    const meta = document.createElement("div");
+    meta.className = "w-meta";
+    meta.textContent = (phaseNames[w.phase] || w.phase) + (w.sceneIndex ? " · 第" + w.sceneIndex + "场" : "") + (w.updatedAt ? " · " + whenOf(w.updatedAt) : "");
+    info.appendChild(title);
+    info.appendChild(meta);
+    const enter = document.createElement("button");
+    enter.className = "w-enter";
+    enter.textContent = w.id === SESSION ? "当前" : "进入";
+    if (w.id !== SESSION) enter.onclick = (e) => {
+      e.stopPropagation();
+      const u = new URL(location.href);
+      u.searchParams.set("session", w.id);
+      location.href = u.toString();
+    };
+    else enter.disabled = true;
+    row.appendChild(info);
+    row.appendChild(enter);
+    row.onclick = () => { selectedWorld = w.id; markCurrent(); loadSaveTree(w.id); };
+    worldListEl.appendChild(row);
+  }
+  if (!worldListEl.querySelector(".world-row.current")) selectedWorld = worlds[0].id;
+  markCurrent();
+  loadSaveTree(selectedWorld);
+}
+
+function markCurrent() {
+  worldListEl.querySelectorAll(".world-row").forEach((el) => el.classList.remove("current"));
+  for (const el of worldListEl.querySelectorAll(".world-row")) {
+    if (el.dataset.wid === selectedWorld) el.classList.add("current");
+  }
+}
+
+async function loadSaveTree(worldId) {
+  saveTreeEl.innerHTML = '<div class="st-head">存 档 树 · ' + worldId + '</div>';
+  let saves = [];
+  try {
+    saves = await fetch("/api/saves?session=" + encodeURIComponent(worldId), { headers: { authorization: "Bearer " + TOKEN } }).then((x) => x.json());
+  } catch (e) { /* 静默 */ }
+  if (!Array.isArray(saves)) saves = [];
+  if (saves.length === 0) {
+    saveTreeEl.insertAdjacentHTML("beforeend", '<div class="st-empty">（该世界还没有存档）</div>');
+    return;
+  }
+  const byParent = new Map();
+  const names = new Set(saves.map((s) => s.name));
+  for (const s of saves) {
+    const key = s.parent && names.has(s.parent) ? s.parent : "";
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(s);
+  }
+  const addNode = (s, depth, prefix) => {
+    const div = document.createElement("div");
+    div.className = "st-node" + (worldId === SESSION ? " loadable" : "");
+    div.style.marginLeft = depth * 18 + "px";
+    const label = document.createElement("span");
+    label.textContent = (depth ? prefix : "● ") + s.name;
+    const meta = document.createElement("span");
+    meta.className = "st-meta";
+    meta.textContent = (s.title ? s.title + " · " : "") + (phaseNames[s.phase] || s.phase) + (s.sceneIndex ? " · 第" + s.sceneIndex + "场" : "") + (s.updatedAt ? " · " + whenOf(s.updatedAt) : "");
+    div.appendChild(label);
+    div.appendChild(meta);
+    if (worldId === SESSION) div.title = "点击读档「" + s.name + "」";
+    if (worldId === SESSION) div.onclick = async () => {
+      if (!(await confirmEl.ask("读档「" + s.name + "」？当前未存档进度将丢失。"))) return;
+      await command("load:" + s.name);
+      location.reload();
+    };
+    saveTreeEl.appendChild(div);
+    const children = byParent.get(s.name) ?? [];
+    children.forEach((c, i) => addNode(c, depth + 1, i === children.length - 1 ? "└─ " : "├─ "));
+  };
+  for (const root of byParent.get("") ?? []) addNode(root, 0, "● ");
+}
+
+// ---------- 设置 ----------
+const settingsDlg = $("settingsDlg");
+$("settingsBtn").onclick = async () => {
+  const s = await api("/api/settings");
+  if (!s || s.ok === false) { toastsEl.show((s && s.message) || "读取设置失败", "err"); return; }
+  $("setMode").value = lastMode;
+  $("setScenes").value = s.settings.scenesPerArc;
+  $("setArcs").value = s.settings.maxArcs;
+  $("setWeb").checked = !!s.settings.webSearch;
+  $("setLan").textContent = location.origin + "/?token=" + s.token;
+  $("setToken").textContent = s.token;
+  settingsDlg.showModal();
+};
+$("setCancel").onclick = () => settingsDlg.close();
+$("setSave").onclick = async () => {
+  // 模式：与当前不同才发命令
+  const wantMode = $("setMode").value;
+  if (wantMode !== lastMode) await command("mode:" + wantMode);
+  const r = await api("/api/settings", {
+    scenesPerArc: Number($("setScenes").value),
+    maxArcs: Number($("setArcs").value),
+    webSearch: $("setWeb").checked,
+  });
+  if (r && r.ok === false) { toastsEl.show(r.message || "保存失败", "err"); return; }
+  toastsEl.show("设置已保存", "ok");
+  settingsDlg.close();
+};
 
 async function showFile(rel) {
   const r = await api("/api/file?path=" + encodeURIComponent(rel) + "&token=" + encodeURIComponent(TOKEN));

@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ArcOutline, CharacterCard, CharacterState, DiceCheck, ForeshadowEntry, LedgerEntry, SceneReport, StoryDesign } from "./types.js";
+import type { ArcOutline, CharacterCard, CharacterState, DiceCheck, ForeshadowEntry, LedgerEntry, RuntimeSettings, SceneReport, StoryDesign, WorldEntity } from "./types.js";
+import { ENGINE } from "../config.js";
+import { findEconomyTemplate } from "../economy/templates.js";
 
 // ---------------------------------------------------------------------------
 // 工作区布局（文件即唯一事实源）
@@ -142,10 +144,20 @@ export class Store {
 	async saveDesignBible(design: StoryDesign): Promise<void> {
 		await this.writeText("设定/世界观.md", `# 世界观\n\n## 故事 premise\n${design.premise}\n\n${design.worldRules}\n`);
 		await this.writeText("设定/规则.md", `# 世界规则\n\n${design.worldRules}\n`);
+		// 经济：模板基准价表（若选用）是代码锚点，进 md 供上下文引用
+		const tpl = design.economy.templateId ? findEconomyTemplate(design.economy.templateId) : undefined;
+		const priceLines = tpl ? tpl.commodities.map((c) => `- ${c.name}：${c.basePrice}（${c.unit}）`).join("\n") : "";
+		const wageLines = tpl ? tpl.wages.map((w) => `- ${w.name}：月 ${w.monthly}`).join("\n") : "";
 		await this.writeText(
 			"设定/经济.md",
-			`# 经济体系\n\n## 计价单位\n${design.economy.currency}\n\n## 概述\n${design.economy.overview}\n`,
+			`# 经济体系\n\n## 计价单位\n${design.economy.currency}\n\n## 概述\n${design.economy.overview}\n` +
+				(tpl ? `\n## 物价基准（${tpl.name}；引擎锚点，禁止凭空偏离）\n${priceLines}\n\n## 收入基准\n${wageLines}\n\n## 模板要点\n${tpl.notes}\n` : ""),
 		);
+		if (tpl) {
+			await this.writeJson("设定/经济.json", { templateId: tpl.id, currency: design.economy.currency, commodities: tpl.commodities, wages: tpl.wages });
+		}
+		// 世界实体：宏观对象注册（设计即固定，状态随剧情演化）
+		await this.saveEntities(design.entities ?? []);
 		await this.writeJson("设定/属性.json", { attributes: design.attributes });
 		await this.writeText("大纲/总纲.md", `# ${design.title}\n\n## 故事梗概\n${design.premise}\n`);
 		for (const c of design.characters) {
@@ -257,11 +269,15 @@ export class Store {
 		);
 	}
 
-	/** 最近 n 个场景摘要（含场景号），按场景号升序返回 */
-	async recentSummaries(beforeScene: number, n: number): Promise<{ scene: number; title: string; summary: string }[]> {
+	/**
+	 * 最近 n 个场景摘要（含场景号），按场景号升序返回。
+	 * 闭区间语义：latestScene 是"最后一场已完成场景"的编号，本身必须包含在内——
+	 * 写第 N 场时调用方传 sceneIndex=N-1，恰好覆盖 1..N-1 的全部已完成场。
+	 */
+	async recentSummaries(latestScene: number, n: number): Promise<{ scene: number; title: string; summary: string }[]> {
 		const out: { scene: number; title: string; summary: string }[] = [];
-		const start = Math.max(1, beforeScene - n);
-		for (let i = start; i < beforeScene; i++) {
+		const start = Math.max(1, latestScene - n + 1);
+		for (let i = start; i <= latestScene; i++) {
 			const md = await this.readText(`记忆/场景摘要/场景-${this.sceneNo(i)}.md`);
 			if (md === null) continue;
 			const [, title, summary] = md.match(/^# 场景\d+：(.*)\n\n([\s\S]*)$/u) ?? [, `场景${i}`, md];
@@ -270,9 +286,10 @@ export class Store {
 		return out;
 	}
 
-	async previousSceneTail(sceneIndex: number, chars: number): Promise<string | null> {
-		if (sceneIndex <= 1) return null;
-		const md = await this.readText(`章稿/场景-${this.sceneNo(sceneIndex - 1)}.md`);
+	/** 上一场（latestScene 本身）的结尾原文：写第 N 场时 latestScene=N-1 即上一场 */
+	async previousSceneTail(latestScene: number, chars: number): Promise<string | null> {
+		if (latestScene <= 0) return null;
+		const md = await this.readText(`章稿/场景-${this.sceneNo(latestScene)}.md`);
 		if (md === null) return null;
 		return md.slice(-chars);
 	}
@@ -301,6 +318,48 @@ export class Store {
 
 	async appendChoice(sceneIndex: number, choice: string, source: "player" | "auto"): Promise<void> {
 		await this.appendLine("记忆/选择历史.jsonl", JSON.stringify({ scene: sceneIndex, choice, source, at: new Date().toISOString() }));
+	}
+
+	// -- 运行时设置（工作区级，设置界面读写） --------------------------------------
+
+	private settingsCache: RuntimeSettings | null = null;
+
+	async loadSettings(): Promise<RuntimeSettings> {
+		if (this.settingsCache) return this.settingsCache;
+		const saved = await this.readJson<Partial<RuntimeSettings>>("设置.json");
+		this.settingsCache = {
+			scenesPerArc: Math.min(50, Math.max(2, Math.round(Number(saved?.scenesPerArc) || ENGINE.scenesPerArc))),
+			maxArcs: Math.min(20, Math.max(1, Math.round(Number(saved?.maxArcs) || ENGINE.maxArcs))),
+			webSearch: saved?.webSearch ?? true,
+		};
+		return this.settingsCache;
+	}
+
+	async saveSettings(settings: RuntimeSettings): Promise<void> {
+		this.settingsCache = settings;
+		await this.writeJson("设置.json", settings);
+	}
+
+	// -- 世界实体 ---------------------------------------------------------------
+
+	async saveEntities(entities: WorldEntity[]): Promise<void> {
+		await this.writeJson("设定/实体.json", entities);
+	}
+
+	async loadEntities(): Promise<WorldEntity[]> {
+		return (await this.readJson<WorldEntity[]>("设定/实体.json")) ?? [];
+	}
+
+	// -- 史料库（联网查证固化的现实知识） -----------------------------------------
+
+	async listHistoryNotes(): Promise<{ file: string; content: string }[]> {
+		const files = (await this.listDir("设定")).filter((f) => f.startsWith("史料-") && f.endsWith(".md"));
+		const out: { file: string; content: string }[] = [];
+		for (const f of files) {
+			const content = await this.readText(`设定/${f}`);
+			if (content) out.push({ file: `设定/${f}`, content });
+		}
+		return out;
 	}
 
 	// -- 检索（供 search_story 工具使用） ---------------------------------------

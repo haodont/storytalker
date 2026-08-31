@@ -103,7 +103,7 @@ export function startTui(engine: Engine): { tui: TUI; requestRender: () => void 
 				break;
 			case "review":
 				if (!ev.pass) {
-					newBlock(dim(`【校对】第 ${ev.attempt} 稿发现 ${ev.issues.length} 处疑义，打回重写：`));
+					newBlock(dim(`【校对】发现 ${ev.issues.length} 处疑义（按终稿呈现，遗留问题带入下一场推演）：`));
 					for (const issue of ev.issues.slice(0, 3)) {
 						newBlock(dim(`  · 「${issue.quote.slice(0, 40)}…」→ ${issue.problem}`));
 					}

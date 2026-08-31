@@ -126,7 +126,6 @@ async function buildFixture(): Promise<{ store: Store; state: GameState }> {
 		arcBeatIndex: 2,
 		arc: { title: "第一弧·初遇", goal: "主角与神秘人的初次交锋，揭开芯片秘密的一角" },
 		arcCount: 1,
-		attempt: 0,
 		pendingReport: null,
 		ideaMsgs: [],
 		currentOutline: "1）主角决定原地观察，神秘人却在暗处主动接近；\n2）神秘人抛出关于芯片的第一条线索，暗示「伊甸园」；\n3）主角试图反问，对方以警告回应后隐入雨中；\n结尾钩子：主角发现自己的手机被远程激活。",

@@ -1,7 +1,8 @@
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Store } from "../facts/store.js";
-import type { DiceCheck, SceneReport, StoryDesign, Verdict } from "../facts/types.js";
+import type { DiceCheck, SceneReport, StoryDesign, Verdict, WorldEntity } from "../facts/types.js";
+import { listEconomyTemplates } from "../economy/templates.js";
 
 /** 一次 agent 运行中，工具提交的结构化产物（引擎从这里读回） */
 export interface ToolCollector {
@@ -11,6 +12,7 @@ export interface ToolCollector {
 	nextOutline?: { outline: string };
 	distilled?: { characters: { name: string; basics: string; knowledge: string[] }[] };
 	arcRevision?: { title: string; goal: string };
+	arcPlan?: { decision: "continue" | "finish"; title?: string; goal?: string; reason?: string };
 }
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
@@ -65,15 +67,34 @@ export function designStoryTool(store: Store, collector: ToolCollector): AgentTo
 	return {
 		name: "design_story",
 		label: "设计开局",
-		description: "提交故事开局设计：书名、premise、世界规则、主要角色（含初始状态）、第一弧大纲（8-12 个场景拍子）",
+		description: "提交故事开局设计：书名、premise、世界规则、主要角色（含初始状态）、第一弧目标与开场拍",
 		parameters: Type.Object({
 			title: Type.String(),
 			premise: Type.String({ description: "50 字以内的故事核心梗概" }),
 			worldRules: Type.String({ description: "世界规则与核心设定，400 字以内；经济细节写入 economy 字段而非此处" }),
 			economy: Type.Object({
-				currency: Type.String({ description: "这个世界流通的货币/资源的名称，如「信用点」「铜钱」「罐头」" }),
+				templateId: Type.Optional(
+					Type.String({ description: "经济模板 id：从设计任务给出的可用模板列表中选最贴题材的一个；不确定就留空" }),
+				),
+				currency: Type.String({ description: "这个世界流通的货币/资源的名称，如「银两」「人民币」「罐头」；选了模板则与模板一致" }),
 				overview: Type.String({ description: "经济体系概述 150 字以内：人们靠什么谋生、关键资源的稀缺性与归属、贫富与阶层概况、主角的经济状况（缺不缺钱）" }),
 			}),
+			entities: Type.Optional(
+				Type.Array(
+					Type.Object({
+						name: Type.String({ description: "实体名，如「北京城」「穿越者自治会」「电报局」" }),
+						type: Type.Union([
+							Type.Literal("势力"), Type.Literal("地域"), Type.Literal("机构"),
+							Type.Literal("资源"), Type.Literal("技术"), Type.Literal("其他"),
+						]),
+						description: Type.String({ description: "这个实体是什么、在故事中的位置，80 字以内" }),
+						state: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number()]), {
+							description: "初始动态状态，如 {人口: 800000, 民心: 5, 粮食储备: 「紧张」}",
+						}),
+					}),
+					{ description: "世界实体（3-8 个）：宏观对象如城市、势力、关键资源；角色已有角色卡，不要重复" },
+				),
+			),
 			characters: Type.Array(
 				Type.Object({
 					name: Type.String(),
@@ -161,11 +182,19 @@ export function d20CheckTool(store: Store, sceneIndex: number, budget: { used: n
 			const card = await store.loadCharacter(p.character);
 			const stat = card?.state.stats?.[p.attribute];
 			if (typeof stat === "number") mod = Math.floor((stat - 10) / 2);
+			// 未登记属性提示：写进日志与返回值，校对可据此核对叙述
+			let note = "";
+			if (!card) note = "（无角色卡，按普通人处理）";
+			else if (typeof stat !== "number") note = `（角色卡未登记属性「${p.attribute}」，修正按 0 计）`;
+			else {
+				const attrs = await store.loadAttributes();
+				if (attrs.length > 0 && !attrs.includes(p.attribute)) note = `（属性「${p.attribute}」不在世界属性表中）`;
+			}
 			const total = roll + mod;
 			const outcome: DiceCheck["outcome"] = roll === 20 ? "大成功" : roll === 1 ? "大失败" : total >= dc ? "成功" : "失败";
 			budget.used += 1;
-			await store.appendDiceCheck({ scene: sceneIndex, character: p.character, attribute: p.attribute, dc, roll, mod, total, outcome, reason: p.reason });
-			return text(`判定结果：${p.character}〔${p.attribute}〕d20(${roll})${mod >= 0 ? "+" : ""}${mod}=${total} vs DC${dc} → ${outcome}。叙述必须服从此结果。`);
+			await store.appendDiceCheck({ scene: sceneIndex, character: p.character, attribute: p.attribute, dc, roll, mod, total, outcome, reason: p.reason + note });
+			return text(`判定结果：${p.character}〔${p.attribute}〕d20(${roll})${mod >= 0 ? "+" : ""}${mod}=${total} vs DC${dc} → ${outcome}${note}。叙述必须服从此结果。`);
 		},
 	};
 }
@@ -218,6 +247,17 @@ export function sceneReportTool(collector: ToolCollector): AgentTool {
 					{ description: "本场景发生的收支流水；引擎据此结算角色余额并写账本。场景涉及金钱往来时必填" },
 				),
 			),
+			entityUpdates: Type.Optional(
+				Type.Array(
+					Type.Object({
+						name: Type.String({ description: "实体名（须已在世界实体中注册）" }),
+						patch: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number()]), {
+							description: "本场景导致的实体状态变化，如 {民心: -2, 气候: 「大雪封城」}",
+						}),
+					}),
+					{ description: "本场景引起的世界实体状态变化（宏观层面的后果，如物价波动、势力消长）；无则留空" },
+				),
+			),
 		}),
 		execute: async (_id, report) => {
 			collector.report = report as SceneReport;
@@ -249,6 +289,27 @@ export function memoryDistillTool(collector: ToolCollector): AgentTool {
 	};
 }
 
+/** Director 专用：plan_next_arc（弧边界：续弧或完结） */
+export function arcPlanTool(collector: ToolCollector): AgentTool {
+	return {
+		name: "plan_next_arc",
+		label: "弧边界规划",
+		description: "弧收束后提交故事走向决定：continue 设计下一弧（标题+一句话目标），finish 收束全篇（说明悬念如何解决）",
+		parameters: Type.Object({
+			decision: Type.Union([Type.Literal("continue"), Type.Literal("finish")], {
+				description: "continue=核心悬念未了，开下一弧；finish=premise 承诺的冲突已解决，完结",
+			}),
+			title: Type.Optional(Type.String({ description: "continue 时必填：下一弧标题" })),
+			goal: Type.Optional(Type.String({ description: "continue 时必填：下一弧的一句话目标，须从未回收伏笔与本弧结局自然生长" })),
+			reason: Type.Optional(Type.String({ description: "finish 时必填：核心悬念如何解决、哪些伏笔收了/留白" })),
+		}),
+		execute: async (_id, raw) => {
+			collector.arcPlan = raw as { decision: "continue" | "finish"; title?: string; goal?: string; reason?: string };
+			return text("弧边界规划已提交。");
+		},
+	};
+}
+
 /** Director 专用：save_arc_revision（玩家通过聊天意见修订弧大纲） */
 export function arcRevisionTool(store: Store, collector: ToolCollector, arcIndex: number): AgentTool {
 	return {
@@ -264,6 +325,103 @@ export function arcRevisionTool(store: Store, collector: ToolCollector, arcIndex
 			await store.saveArc(arcIndex, { title, goal });
 			collector.arcRevision = { title, goal };
 			return text("弧大纲修订已保存。");
+		},
+	};
+}
+
+/** 通用：web_search（联网查证现实知识；引擎自研，Bing 优先 DuckDuckGo 兜底，零依赖） */
+export function webSearchTool(): AgentTool {
+	return {
+		name: "web_search",
+		label: "联网查证",
+		description: "搜索真实世界资料（史实、物价、地理、技术水平等），用于让故事贴合现实背景。返回若干条标题+摘要+链接。只用于查证现实知识，不用于虚构剧情。",
+		parameters: Type.Object({
+			query: Type.String({ description: "搜索词，可用空格分隔关键词，如「清末 1900年 北京 米价 银两」" }),
+		}),
+		execute: async (_id, params) => {
+			const { query } = params as { query: string };
+			const results = await webSearch(query);
+			if (results === null) return text(`（联网搜索失败：本次查证不可用，请依据你已有的知识继续，并在行文时保持保守）`);
+			if (results.length === 0) return text(`（「${query}」无搜索结果）`);
+			return text(results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`).join("\n"));
+		},
+	};
+}
+
+interface WebSearchResult { title: string; snippet: string; url: string }
+
+const stripTags = (s: string) =>
+	s
+		.replace(/<[^>]*>/g, "")
+		.replace(/&nbsp;/g, " ")
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&#39;/g, "'")
+		.replace(/&quot;/g, '"')
+		.replace(/<[^>]*$/g, "")
+		.trim();
+
+async function webSearch(query: string): Promise<WebSearchResult[] | null> {
+	const bing = await trySearch(
+		`https://cn.bing.com/search?q=${encodeURIComponent(query)}&mkt=zh-CN&count=8`,
+		/<li class="b_algo"[\s\S]*?<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>([\s\S]*?)<\/li>/g,
+		/<p[^>]*>([\s\S]*?)<\/p>/,
+	);
+	if (bing && bing.length > 0) return bing;
+	const ddg = await trySearch(
+		`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+		/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]*class="result__a"|<\/div>\s*<\/div>\s*<\/div>|$)/g,
+		/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/,
+	);
+	return ddg;
+}
+
+async function trySearch(url: string, itemRe: RegExp, snippetRe: RegExp): Promise<WebSearchResult[] | null> {
+	try {
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), 9000);
+		const res = await fetch(url, {
+			headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36", "accept-language": "zh-CN,zh;q=0.9" },
+			signal: ctrl.signal,
+		});
+		clearTimeout(timer);
+		if (!res.ok) return null;
+		const html = await res.text();
+		const out: WebSearchResult[] = [];
+		for (const m of html.matchAll(itemRe)) {
+			const url2 = (m[1] ?? "").trim();
+			const title = stripTags(m[2] ?? "");
+			const seg = m[3] ?? "";
+			const sn = seg.match(snippetRe);
+			const snippet = stripTags(sn?.[1] ?? seg).slice(0, 220);
+			if (title && url2.startsWith("http")) out.push({ title, snippet, url: url2 });
+			if (out.length >= 6) break;
+		}
+		return out;
+	} catch {
+		return null;
+	}
+}
+
+/** 通用：save_history_notes（把查证到的史实固化进史料库，供后续所有场景参照） */
+export function saveHistoryNotesTool(store: Store): AgentTool {
+	return {
+		name: "save_history_notes",
+		label: "存史料",
+		description: "把联网查证到的史实/背景知识（物价、技术、政治格局、生活细节…）保存进故事史料库。设计开局时应尽量把关键史实固化下来，后续场景写作将自动参照。",
+		parameters: Type.Object({
+			title: Type.String({ description: "史料标题，如「清末物价与民生」" }),
+			content: Type.String({ description: "史料要点，分条陈述，300-800 字；写对剧情有约束力的事实，不要小说笔法" }),
+		}),
+		execute: async (_id, params) => {
+			const { title, content } = params as { title: string; content: string };
+			const slug = title.replace(/[^\w一-鿿-]/g, "").slice(0, 24) || "笔记";
+			await store.writeText(`设定/史料-${slug}.md`, `# ${title}
+
+${content}
+`);
+			return text(`史料已保存：设定/史料-${slug}.md`);
 		},
 	};
 }

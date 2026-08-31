@@ -263,6 +263,55 @@
   ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
   ::-webkit-scrollbar-corner { background: transparent; }
   * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+
+  /* 设置弹窗 */
+  #settingsDlg {
+    background: var(--panel, #1d1d21); color: var(--ink, #d8d5cf); border: 1px solid var(--line, #2a2a30);
+    border-radius: 14px; padding: clamp(18px, 2.6vw, 28px); width: clamp(320px, 90vw, 480px); max-width: 90vw;
+    font-family: var(--sans, system-ui, sans-serif); box-shadow: 0 16px 48px rgba(0,0,0,.6);
+  }
+  #settingsDlg::backdrop { background: rgba(0,0,0,.55); }
+  #settingsDlg h3 { margin: 0 0 18px; font-size: 17px; color: var(--accent, #d9a45b); letter-spacing: 4px; }
+  #settingsDlg label { display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; color: var(--dim, #7a7770); margin-bottom: 14px; }
+  #settingsDlg label.chk { flex-direction: row; align-items: center; gap: 8px; font-size: 14px; color: var(--ink, #d8d5cf); }
+  #settingsDlg select, #settingsDlg input[type="number"] {
+    background: var(--bg, #141416); border: 1px solid var(--line, #2a2a30); color: var(--ink, #d8d5cf);
+    border-radius: 8px; padding: 8px 11px; font-size: 14.5px; font-family: inherit; outline: none;
+  }
+  #settingsDlg input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent, #d9a45b); }
+  #settingsDlg .setinfo { font-size: 12.5px; line-height: 1.8; color: var(--dim, #7a7770); margin: 6px 0 16px; word-break: break-all; }
+  #settingsDlg .setinfo code { color: var(--accent, #d9a45b); font-size: 12px; }
+  #settingsDlg .row { display: flex; gap: 8px; justify-content: flex-end; }
+  #settingsDlg button { border-radius: 8px; padding: 8px 18px; font-size: 14px; cursor: pointer; font-family: inherit; background: none; border: 1px solid var(--line, #2a2a30); color: var(--dim, #7a7770); }
+  #settingsDlg button.primary { background: var(--accent, #d9a45b); border-color: var(--accent, #d9a45b); color: #20100c; font-weight: 700; }
+
+  /* 世界与存档弹窗 */
+  #worldsDlg {
+    background: var(--panel, #1d1d21); color: var(--ink, #d8d5cf); border: 1px solid var(--line, #2a2a30);
+    border-radius: 14px; padding: clamp(18px, 2.6vw, 28px); width: clamp(340px, 92vw, 560px); max-width: 92vw;
+    font-family: var(--sans, system-ui, sans-serif); box-shadow: 0 16px 48px rgba(0,0,0,.6);
+  }
+  #worldsDlg::backdrop { background: rgba(0,0,0,.55); }
+  #worldsDlg h3 { margin: 0 0 14px; font-size: 17px; color: var(--accent, #d9a45b); letter-spacing: 4px; }
+  #worldsDlg .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap; }
+  #worldsDlg button { border-radius: 8px; padding: 8px 14px; font-size: 13.5px; cursor: pointer; font-family: inherit; background: none; border: 1px solid var(--line, #2a2a30); color: var(--dim, #7a7770); }
+  .world-row {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px; margin-bottom: 6px; cursor: pointer;
+    border: 1px solid var(--line, #2a2a30); border-radius: 10px; transition: border-color .15s, background .15s;
+  }
+  .world-row:hover { border-color: var(--accent, #d9a45b); background: var(--panel2, #232328); }
+  .world-row.current { border-color: var(--accent, #d9a45b); }
+  .world-row .w-info { flex: 1; min-width: 0; }
+  .world-row .w-title { font-weight: 700; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .world-row .w-meta { font-size: 12px; color: var(--dim, #7a7770); margin-top: 2px; }
+  .world-row .w-enter { flex-shrink: 0; }
+  .savetree { margin-top: 12px; max-height: 34vh; overflow-y: auto; font-size: 13.5px; line-height: 1.5; }
+  .savetree .st-head { font-size: 11px; letter-spacing: 3px; color: var(--dim, #7a7770); margin-bottom: 8px; }
+  .savetree .st-node { padding: 5px 8px; border-radius: 8px; cursor: default; color: var(--ink, #d8d5cf); }
+  .savetree .st-node .st-meta { color: var(--dim, #7a7770); font-size: 12px; margin-left: 8px; }
+  .savetree .st-node.loadable { cursor: pointer; }
+  .savetree .st-node.loadable:hover { background: var(--panel2, #232328); }
+  .savetree .st-empty { color: var(--dim, #7a7770); padding: 5px 8px; }
 </style>
 </head>
 <body>
@@ -276,6 +325,8 @@
       <button id="fontMinus" class="sm" title="减小正文字号">A-</button>
       <button id="fontPlus" class="sm" title="增大正文字号">A+</button>
       <button id="themeBtn" class="sm" title="切换 夜间/纸质 主题">纸</button>
+      <button id="settingsBtn" class="sm" title="设置">⚙</button>
+      <button id="worldsBtn" class="sm" title="世界与存档">世界</button>
     </div>
     <span class="hsep"></span>
     <div class="hgroup">
@@ -312,6 +363,37 @@
 <x-toast-host id="toasts"></x-toast-host>
 <button id="jumpBtn">↓ 最新</button>
 <x-confirm id="confirm"></x-confirm>
+<dialog id="worldsDlg">
+  <h3>世 界</h3>
+  <div id="worldList"></div>
+  <div id="saveTree" class="savetree"></div>
+  <div class="row">
+    <button id="worldCreate">新建世界</button>
+    <button id="worldFork">⑂ 分叉当前世界</button>
+    <button id="worldsClose">关闭</button>
+  </div>
+</dialog>
+<dialog id="settingsDlg">
+  <h3>设 置</h3>
+  <label>推进模式
+    <select id="setMode">
+      <option value="auto">自动（挂机阅读）</option>
+      <option value="manual">手动（每场景做选择）</option>
+    </select>
+  </label>
+  <label>每弧场景数
+    <input id="setScenes" type="number" min="2" max="50" step="1">
+  </label>
+  <label>弧数上限（达上限强制完结）
+    <input id="setArcs" type="number" min="1" max="20" step="1">
+  </label>
+  <label class="chk"><input id="setWeb" type="checkbox"> 设计开局时允许联网查证史实</label>
+  <div class="setinfo">局域网访问（手机/其他设备）：<code id="setLan"></code><br>当前令牌：<code id="setToken"></code></div>
+  <div class="row">
+    <button id="setCancel">取消</button>
+    <button id="setSave" class="primary">保存</button>
+  </div>
+</dialog>
 <!-- 开源组件（本地 vendored，无 CDN 依赖）：
      霞鹜文楷 —— 开源正文字体；marked —— Markdown 渲染；DOMPurify —— 渲染结果净化；
      highlight.js —— 代码高亮；dayjs —— 相对时间；canvas-confetti —— 完结庆祝 -->

@@ -1,12 +1,12 @@
 import { ENGINE } from "../config.js";
 import { runAgent } from "../agents/agents.js";
-import { arcRevisionTool, designStoryTool, d20CheckTool, memoryDistillTool, sceneOutlineTool, sceneReportTool, sharedReadTools, verdictTool, type ToolCollector } from "../agents/tools.js";
-import { DESIGN_SYSTEM, DISTILL_SYSTEM, IDEA_SYSTEM, OUTLINE_SYSTEM, REPORT_SYSTEM, REVIEWER_SYSTEM, WRITER_SYSTEM } from "../agents/prompts.js";
+import { arcRevisionTool, arcPlanTool, designStoryTool, d20CheckTool, memoryDistillTool, saveHistoryNotesTool, sceneOutlineTool, sceneReportTool, sharedReadTools, verdictTool, webSearchTool, type ToolCollector } from "../agents/tools.js";
+import { ARC_PLAN_SYSTEM, DESIGN_SYSTEM, DISTILL_SYSTEM, IDEA_SYSTEM, OUTLINE_SYSTEM, REPORT_SYSTEM, REVIEWER_SYSTEM, WRITER_SYSTEM } from "../agents/prompts.js";
 import type { Store } from "../facts/store.js";
-import type { GameState, PlayMode, SceneReport, StoryDesign } from "../facts/types.js";
+import type { GameState, PlayMode, RuntimeSettings, SceneReport, StoryDesign } from "../facts/types.js";
 import type { Llm } from "../llm.js";
-import { assembleBootPrompt, assembleDirectorReportPrompt, assembleMemoryDistillPrompt, assembleArcDistillPrompt, assembleOutlineDerivationPrompt, assembleOutlineReviewPrompt, assembleReviewerPrompt, assembleWriterPrompt, draftPrecheckNotes, extractCurrency } from "./context.js";
-import { applyCharacterPatches, applyForeshadowOps, applyTransactions, sanitizeReport } from "./settle.js";
+import { assembleArcPlanPrompt, assembleBootPrompt, assembleDirectorReportPrompt, assembleMemoryDistillPrompt, assembleArcDistillPrompt, assembleOutlineDerivationPrompt, assembleOutlineReviewPrompt, assembleReviewerPrompt, assembleWriterPrompt, draftPrecheckNotes, extractCurrency } from "./context.js";
+import { applyCharacterPatches, applyEntityPatches, applyForeshadowOps, applyTransactions, sanitizeReport } from "./settle.js";
 
 // ---------------------------------------------------------------------------
 // 确定性复读检测：小模型可能陷入 n-gram 循环并耗尽 token 预算。
@@ -131,6 +131,12 @@ export function sanitizeDesign(design: StoryDesign): { design: StoryDesign; warn
 // 每个状态变更后原子落盘 autosave，进程崩溃后可从 current.json 恢复。
 // ---------------------------------------------------------------------------
 
+/** GameState 结构版本：加字段/改语义时递增，restoreOrEmpty 的 normalizeState 兜底 */
+const CURRENT_SCHEMA_VERSION = 2;
+
+/** 存档名白名单（存档/与 分叉入档共用）：字母数字_- 与中文，防路径逃逸 */
+const SAVE_NAME_RE = /^[\w一-鿿-]{1,64}$/;
+
 export type EngineEvent =
 	| { type: "phase"; phase: GameState["phase"] }
 	| { type: "status"; text: string }
@@ -139,7 +145,7 @@ export type EngineEvent =
 	| { type: "idea_done"; text: string }
 	| { type: "scene_delta"; text: string }
 	| { type: "scene_done"; scene: number; title: string; text: string }
-	| { type: "review"; attempt: number; pass: boolean; issues: { quote: string; constraint: string; problem: string }[] }
+	| { type: "review"; pass: boolean; issues: { quote: string; constraint: string; problem: string }[] }
 	| { type: "agent_process"; role: "director" | "writer" | "reviewer"; kind: "delta" | "tool"; text: string }
 	| { type: "boot_ready"; title: string; premise: string; characters: string[]; arcTitle: string; arcGoal: string; openingBeat: string }
 	| { type: "scene_outline"; scene: number; text: string }
@@ -153,11 +159,34 @@ export class Engine {
 	private state: GameState = Engine.initialState();
 	private currentSteer: ((text: string) => void) | null = null;
 
+	/** 运行时设置（boot 时从工作区加载，设置界面热更新） */
+	settings: RuntimeSettings = { scenesPerArc: ENGINE.scenesPerArc, maxArcs: ENGINE.maxArcs, webSearch: true };
+
 	constructor(
 		public readonly store: Store,
 		private readonly llm: Llm,
 		public emit: (event: EngineEvent) => void,
 	) {}
+
+	/** 更新运行时设置：校验→落盘→生效（下一场景循环即用新值）。返回错误信息（null=成功） */
+	async updateSettings(patch: Partial<RuntimeSettings>): Promise<string | null> {
+		const next = { ...this.settings };
+		if (patch.scenesPerArc !== undefined) {
+			const n = Math.round(Number(patch.scenesPerArc));
+			if (!Number.isFinite(n) || n < 2 || n > 50) return "每弧场景数须为 2-50 的整数";
+			next.scenesPerArc = n;
+		}
+		if (patch.maxArcs !== undefined) {
+			const n = Math.round(Number(patch.maxArcs));
+			if (!Number.isFinite(n) || n < 1 || n > 20) return "弧数上限须为 1-20 的整数";
+			next.maxArcs = n;
+		}
+		if (patch.webSearch !== undefined) next.webSearch = Boolean(patch.webSearch);
+		this.settings = next;
+		await this.store.saveSettings(next);
+		this.emit({ type: "status", text: `设置已更新：每弧 ${next.scenesPerArc} 场 · 弧上限 ${next.maxArcs} · 联网查证${next.webSearch ? "开" : "关"}` });
+		return null;
+	}
 
 	static initialState(): GameState {
 		return {
@@ -169,15 +198,20 @@ export class Engine {
 			arcBeatIndex: 0,
 			arc: null,
 			arcCount: 1,
-			attempt: 0,
 			pendingReport: null,
 			ideaMsgs: [],
+			schemaVersion: CURRENT_SCHEMA_VERSION,
 			updatedAt: new Date().toISOString(),
 		};
 	}
 
 	get gameState(): GameState {
 		return this.state;
+	}
+
+	/** 引擎是否正在推进剧情（场景/设计流水线在途）：restart/load/fork 应避开 */
+	get isBusy(): boolean {
+		return this.pipelineBusy;
 	}
 
 	/**
@@ -206,7 +240,10 @@ export class Engine {
 
 	/** 后台执行并兜底错误（引擎事件流对外只发 error 事件） */
 	private void(p: Promise<void>): void {
-		p.catch((err) => this.emit({ type: "error", message: `引擎错误：${err?.message ?? err}` }));
+		p.catch((err) => {
+			this.pipelineBusy = false; // 出错必须解除互斥，否则 restart/load 被永久挡住
+			this.emit({ type: "error", message: `引擎错误：${err?.message ?? err}` });
+		});
 	}
 
 	/** 过程事件发射器：includeText=false 时只上报工具调用（Writer 正文已有 scene_delta 流，不重复） */
@@ -222,6 +259,7 @@ export class Engine {
 	/** 有存档则恢复；否则进入待开局状态（等待 startPremise） */
 	async boot(): Promise<void> {
 		await this.store.ensureWorkspace();
+		this.settings = await this.store.loadSettings();
 		const saved = await this.store.readJson<GameState>("存档/current.json");
 		if (saved && saved.phase === "ended") {
 			// 上局已完结：以空局进入，但保留完结信息提示
@@ -232,20 +270,23 @@ export class Engine {
 		await this.restoreOrEmpty(saved);
 	}
 
-	/** 从状态快照恢复（boot 与 load 共用）；空快照则进入空局 */
+	/** 从状态快照恢复（boot 与 load 共用）；空快照则进入空局。旧版本存档在此统一归一化 */
 	private async restoreOrEmpty(saved: GameState | null): Promise<void> {
 		if (saved && saved.phase !== "empty" && saved.phase !== "ended") {
-			this.state = saved;
-			if (!this.state.ideaMsgs) this.state.ideaMsgs = [];
+			this.state = Engine.normalizeState(saved);
 			this.emit({ type: "phase", phase: saved.phase });
 			this.emit({ type: "status", text: `已恢复进度：${saved.title || "未命名"}，第 ${saved.sceneIndex} 场` });
 			if (saved.phase === "playing" && saved.pendingReport) {
 				this.presentChoices(saved.pendingReport);
+			} else if (saved.phase === "playing" && saved.substate === "choosing") {
+				// 崩溃窗口：选择已被消费（pendingReport=null 已提交）但走向尚未记账——
+				// 记录已丢失，按自然延续推进下一场（不重复结算本场景）
+				this.emit({ type: "status", text: `上次在选择时中断且走向记录丢失，第 ${saved.sceneIndex} 场后按自然延续推进。` });
+				this.void(this.advanceAfterChoice(null));
 			} else if (saved.phase === "playing") {
 				const labels: Record<string, string> = {
 					writing: "执笔写作",
 					reviewing: "校对审阅",
-					rewriting: "按校对意见重写",
 					settling: "场景定稿落盘",
 				};
 				const label = labels[saved.substate ?? ""];
@@ -253,6 +294,16 @@ export class Engine {
 					this.emit({ type: "status", text: `上次在第 ${saved.sceneIndex + 1} 场的${label}中中断，本场景将重新生成。` });
 				}
 				this.void(this.runScene());
+			} else if (saved.phase === "bootstrapping") {
+				// 设计流程中断：premise 还在，自动重新设计（storyId 不变，继续写同一个故事存档）
+				if (saved.premise?.trim()) {
+					this.emit({ type: "status", text: "上次开局设计被中断，正在重新设计……" });
+					await this.setPhase("empty");
+					this.void(this.startPremise(saved.premise));
+				} else {
+					this.emit({ type: "status", text: "上次开局被中断且灵感记录为空，输入新灵感重新开始。" });
+					await this.setPhase("empty");
+				}
 			} else if (saved.phase === "confirm_bible") {
 				this.emit({ type: "status", text: "开局设计待确认：输入 /accept 开始，或直接输入修改意见。" });
 			} else if (saved.phase === "arc_boundary") {
@@ -269,29 +320,53 @@ export class Engine {
 		}
 	}
 
-	/** 存档位列表（不含 autosave 的 current.json） */
-	async listSaves(): Promise<{ name: string; title: string; phase: string; sceneIndex: number; updatedAt: string }[]> {
+	/** 存档归一化：旧版本快照缺字段时补默认值（新增字段一律在此兜底，替代散点补丁） */
+	static normalizeState(saved: GameState): GameState {
+		return {
+			...saved,
+			schemaVersion: CURRENT_SCHEMA_VERSION,
+			title: saved.title ?? "",
+			premise: saved.premise ?? "",
+			sceneIndex: saved.sceneIndex ?? 0,
+			arcBeatIndex: saved.arcBeatIndex ?? 1,
+			arcCount: saved.arcCount ?? 1,
+			pendingReport: saved.pendingReport ?? null,
+			ideaMsgs: saved.ideaMsgs ?? [],
+		};
+	}
+
+	/** 存档位列表（不含 autosave 的 current.json；parent 构成存档树） */
+	async listSaves(): Promise<{ name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[]> {
 		const files = await this.store.listDir("存档").catch(() => [] as string[]);
-		const out: { name: string; title: string; phase: string; sceneIndex: number; updatedAt: string }[] = [];
+		const out: { name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[] = [];
 		for (const f of files.filter((x) => x.endsWith(".json") && x !== "current.json")) {
 			const s = await this.store.readJson<GameState>(`存档/${f}`);
-			if (s) out.push({ name: f.replace(/\.json$/, ""), title: s.title, phase: s.phase, sceneIndex: s.sceneIndex, updatedAt: s.updatedAt });
+			if (s) out.push({ name: f.replace(/\.json$/, ""), title: s.title ?? "", phase: s.phase ?? "", sceneIndex: s.sceneIndex ?? 0, updatedAt: s.updatedAt ?? "", parent: s.saveParent ?? null });
 		}
 		return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
 	}
 
 	/** 读档：把存档快照恢复为当前进度（ended 存档按原样恢复供回看） */
 	async load(name: string): Promise<void> {
+		if (this.pipelineBusy) {
+			this.emit({ type: "error", message: "引擎正在推进剧情（写作/校对/结算中），请稍后再读档。" });
+			return;
+		}
+		if (!SAVE_NAME_RE.test(name)) {
+			this.emit({ type: "error", message: "存档名只能含中文、字母、数字、_ 或 -，长度 ≤64" });
+			return;
+		}
 		const saved = await this.store.readJson<GameState>(`存档/${name}.json`);
 		if (!saved) {
 			this.emit({ type: "error", message: `存档「${name}」不存在` });
 			return;
 		}
+		saved.saveParent = name; // 记录谱系：此后 /save 的新存档在树上挂在 name 之下
 		if (!saved.ideaMsgs) saved.ideaMsgs = [];
 		this.currentSteer = null;
 		this.ideaBusy = false;
 		if (saved.phase === "ended") {
-			this.state = saved;
+			this.state = Engine.normalizeState(saved);
 			this.emit({ type: "phase", phase: "ended" });
 			this.emit({ type: "status", text: `已读档：《${saved.title || "未命名"}》（已完结，可回看；/restart 开新故事）` });
 			return;
@@ -301,6 +376,9 @@ export class Engine {
 
 	/** 灵感对话互斥锁：上一轮回复未结束前忽略新输入 */
 	private ideaBusy = false;
+
+	/** 场景/设计流水线在途标志：runScene 入口置位，到达等待玩家的节点（choosing/ended）或出错时清除 */
+	private pipelineBusy = false;
 
 	/** d20 判定硬预算：每场重置（约束在代码，不在 prompt） */
 	private diceBudget = { used: 0, max: 3 };
@@ -397,7 +475,7 @@ export class Engine {
 			role: "director",
 			llm: this.llm,
 			system: DESIGN_SYSTEM,
-			tools: [...sharedReadTools(this.store), designStoryTool(this.store, collector)],
+			tools: [...sharedReadTools(this.store), ...(this.settings.webSearch ? [webSearchTool(), saveHistoryNotesTool(this.store)] : []), designStoryTool(this.store, collector)],
 			prompt: assembleBootPrompt(premise),
 			onProcess: this.proc("director", true),
 		});
@@ -437,7 +515,7 @@ export class Engine {
 			role: "director",
 			llm: this.llm,
 			system: DESIGN_SYSTEM,
-			tools: [...sharedReadTools(this.store), designStoryTool(this.store, collector)],
+			tools: [...sharedReadTools(this.store), ...(this.settings.webSearch ? [webSearchTool(), saveHistoryNotesTool(this.store)] : []), designStoryTool(this.store, collector)],
 			prompt: `读者对现有开局设计提出了修改意见：「${feedback}」\n\n请调用 read_bible 查看现有设定后，调用 design_story 重新提交完整开局设计（在原有基础上按意见调整）。`,
 			onProcess: this.proc("director", true),
 		});
@@ -509,7 +587,6 @@ export class Engine {
 		this.state.arc = arc;
 		this.state.arcCount = Math.max(this.state.arcCount, n);
 		this.state.arcBeatIndex = 1;
-		this.state.attempt = 0;
 		this.emit({ type: "status", text: `第 ${n} 弧「${arc.title}」开始，目标：${arc.goal}` });
 		await this.setPhase("playing");
 		await this.runScene();
@@ -530,13 +607,21 @@ export class Engine {
 	/**
 	 * 场大纲推演（两段式）：导播出大纲 → 确定性预检 → 校对审核 → 不过则带意见返工（≤2 轮）。
 	 * 审核通过后大纲与审核意见一起进入 Writer 上下文。
+	 * 跟踪最优大纲：如果多轮都不完美，选取通过硬 gate 且审核意见最少的那一轮。
 	 */
 	private async deriveOutline(): Promise<void> {
 		this.emit({ type: "status", text: "导播正在根据现有剧情推演本场景大纲……" });
 		const knownNames = (await this.store.loadCharacters()).map((c) => c.name);
 		const lastChoice = await this.lastChoiceText();
+		// 上一稿的校对疑义在此消费：写手不打回重写，矛盾靠推演下一场时修正
+		const carryIssues = this.state.draftIssues;
+		this.state.draftIssues = undefined;
 		let issues: { quote: string; constraint: string; problem: string }[] = [];
 		let outline = "";
+		// 最优大纲跟踪：记录通过硬 gate 的最优候选（审核意见最少）
+		let bestOutline = "";
+		let bestIssueCount = Infinity;
+		let bestNotes: string[] | undefined;
 		for (let round = 0; ; round++) {
 			const dCollector: ToolCollector = {};
 			await runAgent({
@@ -544,7 +629,7 @@ export class Engine {
 				llm: this.llm,
 				system: OUTLINE_SYSTEM,
 				tools: [...sharedReadTools(this.store), sceneOutlineTool(this.store, dCollector)],
-				prompt: await assembleOutlineDerivationPrompt(this.store, this.state, round > 0 ? issues : undefined),
+				prompt: await assembleOutlineDerivationPrompt(this.store, this.state, round > 0 ? issues : undefined, carryIssues),
 				onProcess: this.proc("director", true),
 			});
 			outline = dCollector.nextOutline?.outline.trim() ?? "";
@@ -559,7 +644,9 @@ export class Engine {
 			if (hard.length > 0) {
 				issues = hard;
 				if (round >= 2) {
-					this.emit({ type: "status", text: `大纲预检 ${round + 1} 轮仍不达标，带意见交写手。` });
+					this.emit({ type: "status", text: `大纲预检 ${round + 1} 轮仍不达标，使用安全回退大纲。` });
+					outline = bestOutline || "自然延续上一场结尾，让情节有机推进";
+					issues = bestNotes ? [] : issues;
 					break;
 				}
 				this.emit({ type: "status", text: `大纲预检未过（${hard[0]!.problem}），导播修订中……` });
@@ -573,7 +660,7 @@ export class Engine {
 				role: "reviewer",
 				llm: this.llm,
 				system: REVIEWER_SYSTEM,
-				tools: [...sharedReadTools(this.store), verdictTool(vCollector)],
+				tools: [verdictTool(vCollector)], // 约束数据已全部内联，不开放检索工具（省工具环往返）
 				prompt: await assembleOutlineReviewPrompt(this.store, this.state, outline, notes),
 				onProcess: this.proc("reviewer", true),
 			});
@@ -583,8 +670,21 @@ export class Engine {
 				break;
 			}
 			issues = verdict.issues;
+			// 更新最优候选：通过硬 gate 的大纲中，审核意见最少的优先进入
+			if (issues.length < bestIssueCount) {
+				bestOutline = outline;
+				bestIssueCount = issues.length;
+				bestNotes = issues.map((i) => `- ${i.problem}（修改方向：${i.constraint}）`);
+			}
 			if (round >= 2) {
-				this.emit({ type: "status", text: `大纲审核 ${round} 轮仍有疑义，带意见直接交写手（意见会传入写作上下文）。` });
+				// 3 轮都不完美：选用最优候选而非最后一轮的失败稿
+				if (bestOutline && bestIssueCount < issues.length) {
+					this.emit({ type: "status", text: `大纲审核 3 轮仍有疑义，选用第 ${bestIssueCount === 0 ? "通过" : "最优"} 候选（${bestIssueCount} 条意见）交写手。` });
+					outline = bestOutline;
+					issues = [];
+				} else {
+					this.emit({ type: "status", text: `大纲审核 3 轮仍有疑义，带意见直接交写手（意见会传入写作上下文）。` });
+				}
 				break;
 			}
 			this.emit({ type: "status", text: `大纲未过审（${issues.length} 条意见），导播修订中……` });
@@ -596,6 +696,7 @@ export class Engine {
 
 	private async runScene(): Promise<void> {
 		if (this.state.phase !== "playing" || !this.state.arc) return;
+		this.pipelineBusy = true;
 
 		// 0) 两段式推演：若无大纲（第一弧第一场用开局时的开场拍），导播推演场大纲 → 校对审核
 		if (!this.state.currentOutline) {
@@ -612,32 +713,28 @@ export class Engine {
 		}
 		this.emit({ type: "status", text: `场景 ${this.state.sceneIndex + 1}（弧内第${this.state.arcBeatIndex}拍）开写：${(this.state.currentOutline ?? "").slice(0, 60)}…` });
 
-		// 1) Writer 写稿（流式）
-		this.state.attempt = 0;
+		// 1) Writer 写稿（流式）——写手只出终稿，不进打回-重写循环
 		this.diceBudget = { used: 0, max: 3 };
 		await this.setSubstate("writing");
 		let draft = await this.callWriter();
-		let loopIssues = detectRepetitionLoop(draft);
-
-		// 2) Reviewer 校验 → 打回重写环（复读检测是确定性的本地检查，优先于 LLM 校对）
-		await this.setSubstate("reviewing");
-		for (;;) {
-			const verdict =
-				loopIssues.length > 0
-					? { pass: false, issues: loopIssues }
-					: await this.review(draft);
-			if (verdict.pass) break;
-			if (this.state.attempt >= ENGINE.maxRewrites) {
-				this.emit({ type: "status", text: `重写 ${ENGINE.maxRewrites} 次仍有疑义，继续呈现；可用 /steer 干预后续走向。` });
-				break;
-			}
-			this.state.attempt += 1;
-			await this.commit();
-			this.emit({ type: "status", text: `校对未通过（第 ${this.state.attempt} 次重写）……` });
-			await this.setSubstate("rewriting");
-			draft = await this.callWriter(verdict.issues);
-			loopIssues = detectRepetitionLoop(draft);
+		if (detectRepetitionLoop(draft).length > 0) {
+			// 复读是生成事故而非质量判断：整稿重摇一次，重摇稿仍是终稿
+			this.emit({ type: "status", text: "检测到复读循环，重新生成本场景……" });
+			draft = await this.callWriter();
 		}
+
+		// 2) Reviewer 校对（只诊断，不打回）与 Director 场景报告**并行**：两者只消费同一份终稿，互不依赖
+		await this.setSubstate("reviewing");
+		const loopIssues = detectRepetitionLoop(draft);
+		const reviewP = loopIssues.length > 0 ? Promise.resolve({ pass: false, issues: loopIssues } as const) : this.review(draft);
+		const reportP = this.directorReport(draft);
+		reportP.catch(() => {}); // 防未处理拒绝；真实结果在场景定稿后 await
+		const verdict = await reviewP;
+		this.state.draftIssues = verdict.pass ? undefined : verdict.issues.map((i) => `- ${i.problem}（约束：${i.constraint}）`);
+		if (!verdict.pass) {
+			this.emit({ type: "status", text: `校对发现 ${verdict.issues.length} 处疑义，按最终稿呈现；遗留问题已带入下一场推演。` });
+		}
+		await this.commit();
 
 		// 3) 定稿落盘 + 呈现
 		await this.setSubstate("settling");
@@ -647,8 +744,8 @@ export class Engine {
 		await this.commit();
 		this.emit({ type: "scene_done", scene: this.state.sceneIndex, title, text: draft });
 
-		// 4) Director 场景报告（摘要/状态/伏笔/走向候选；落盘前过确定性门禁）
-		const rawReport = await this.directorReport(draft);
+		// 4) 收取并行启动的场景报告（摘要/状态/伏笔/走向候选；落盘前过确定性门禁）
+		const rawReport = await reportP;
 		let report: SceneReport | null = null;
 		if (rawReport) {
 			report = await this.persistReport(rawReport);
@@ -674,6 +771,7 @@ export class Engine {
 			await this.advanceAfterChoice(`${picked.label}——${picked.description}`);
 		} else {
 			this.presentChoices(report);
+			this.pipelineBusy = false; // 到达等待玩家的节点，解除互斥
 		}
 	}
 
@@ -688,7 +786,9 @@ export class Engine {
 		const num = Number(input.trim());
 		const picked = Number.isInteger(num) ? report.choices[num - 1] : undefined;
 		const choice = picked ? `${picked.label}——${picked.description}` : input.trim();
+		// 先清选择并提交，再推进：中途崩溃最多丢一次走向记录，不会重复入账
 		this.state.pendingReport = null;
+		await this.commit();
 		await this.advanceAfterChoice(choice);
 	}
 
@@ -700,21 +800,22 @@ export class Engine {
 		}
 
 		// 弧边界判断（弧长由 scenesPerArc 决定；拍子不再预排）
-		if (this.state.arcBeatIndex >= ENGINE.scenesPerArc) {
+		if (this.state.arcBeatIndex >= this.settings.scenesPerArc) {
 			await this.setPhase("arc_boundary");
 			await this.runArcBoundary();
 			return;
 		}
 		this.state.arcBeatIndex += 1;
-		this.state.attempt = 0;
 		await this.commit();
 		await this.runScene();
 	}
 
 	private async runArcBoundary(): Promise<void> {
-		this.emit({ type: "status", text: "本弧完结，导播正在收束……" });
-		// 弧摘要（一次性补全调用，不走 agent 工具环）
-		const summaries = await this.store.recentSummaries(this.state.sceneIndex, ENGINE.scenesPerArc + 2);
+		this.pipelineBusy = true; // 恢复路径不经 runScene 直达此处，需自行置位
+		const arcNo = this.state.arcCount;
+		this.emit({ type: "status", text: `第 ${arcNo} 弧完结，导播正在收束……` });
+		// 弧摘要（一次性补全调用，不走 agent 工具环；闭区间语义覆盖本弧最后一场）
+		const summaries = await this.store.recentSummaries(this.state.sceneIndex, this.settings.scenesPerArc + 2);
 		const arcSummaryText = `## 弧「${this.state.arc?.title ?? ""}」总结\n${summaries.map((s) => `场景${s.scene}：${s.summary}`).join("\n")}`;
 		await this.store.saveArcSummary(arcSummaryText);
 		this.emit({ type: "arc_boundary", summary: `已写入弧摘要（${summaries.length} 个场景）。` });
@@ -722,8 +823,53 @@ export class Engine {
 		// 记忆蒸馏（幂等：不达标即跳过，0 成本）
 		await this.distillMemories();
 
-		// v1 验证目标为单弧短篇：弧满即完结；多弧规划作为后续迭代
+		// 伏笔一致性检查：弧收束时盘点未回收伏笔，警告导播与读者
+		const openForeshadows = (await this.store.loadForeshadows()).filter((f) => f.status === "open");
+		if (openForeshadows.length > 0) {
+			const list = openForeshadows.map((f) => `「${f.id}」${f.description}（埋于场景${f.plantedAtScene}）`).join("、");
+			this.emit({ type: "status", text: `本弧仍有 ${openForeshadows.length} 条未回收伏笔：${list}——续弧时应优先推进或收束。` });
+		}
+
+		// 弧边界规划：续弧或完结（导播决定；弧数上限强制收束）
+		if (arcNo >= this.settings.maxArcs) {
+			this.emit({ type: "status", text: `已达弧数上限（${this.settings.maxArcs}），故事在此收束。` });
+			await this.finishStory();
+			return;
+		}
+		this.emit({ type: "status", text: "导播正在判断故事命运：续弧还是完结……" });
+		const collector: ToolCollector = {};
+		await runAgent({
+			role: "director",
+			llm: this.llm,
+			system: ARC_PLAN_SYSTEM,
+			tools: [arcPlanTool(collector)], // 判断材料已全部内联，单次提交
+			prompt: await assembleArcPlanPrompt(this.store, this.state),
+			onProcess: this.proc("director", true),
+		});
+		const plan = collector.arcPlan;
+		if (plan?.decision === "continue" && plan.title?.trim() && plan.goal?.trim()) {
+			const next = arcNo + 1;
+			await this.store.saveArc(next, { title: plan.title.trim(), goal: plan.goal.trim() });
+			this.state.arcCount = next;
+			this.emit({ type: "outline_updated", arc: next, title: plan.title.trim(), goal: plan.goal.trim() });
+			await this.commit();
+			await this.beginArc(next); // → runScene 接手 busy
+			return;
+		}
+		if (plan?.decision === "finish") {
+			this.emit({ type: "status", text: `导播决定收束：${plan.reason ?? "核心冲突已解决"}` });
+			if (openForeshadows.length > 0) {
+				this.emit({ type: "status", text: `注意：仍有 ${openForeshadows.length} 条伏笔未回收（${openForeshadows.map((f) => f.id).join("、")}），将在结局中留白。` });
+			}
+		} else {
+			this.emit({ type: "status", text: "弧边界规划未产出有效续弧方案，按完结处理。" });
+		}
+		await this.finishStory();
+	}
+
+	private async finishStory(): Promise<void> {
 		await this.setPhase("ended");
+		this.pipelineBusy = false;
 		this.emit({ type: "ended" });
 	}
 
@@ -775,12 +921,8 @@ export class Engine {
 
 	// -- 角色调用 ----------------------------------------------------------------
 
-	private async callWriter(issues?: { quote: string; constraint: string; problem: string }[]): Promise<string> {
-		const basePrompt = await assembleWriterPrompt(this.store, this.state);
-		const prompt =
-			issues && issues.length > 0
-				? `${basePrompt}\n\n## 校对打回（上一稿与约束清单矛盾，必须修复）\n${issues.map((i, n) => `${n + 1}. 「${i.quote}」违反 ${i.constraint}：${i.problem}`).join("\n")}`
-				: basePrompt;
+	private async callWriter(): Promise<string> {
+		const prompt = await assembleWriterPrompt(this.store, this.state);
 
 		this.emit({ type: "status", text: "执笔中……" });
 			const result = await runAgent({
@@ -816,7 +958,7 @@ export class Engine {
 			role: "reviewer",
 			llm: this.llm,
 			system: REVIEWER_SYSTEM,
-			tools: [...sharedReadTools(this.store), verdictTool(collector)],
+			tools: [verdictTool(collector)], // 约束数据已全部内联，不开放检索工具（省工具环往返）
 			prompt: await assembleReviewerPrompt(this.store, this.state, draft, notes),
 			onProcess: this.proc("reviewer", true),
 		});
@@ -825,7 +967,7 @@ export class Engine {
 			this.emit({ type: "status", text: "校对未返回结论，按通过处理。" });
 			return { pass: true, issues: [] };
 		}
-		this.emit({ type: "review", attempt: this.state.attempt, pass: verdict.pass, issues: verdict.issues });
+		this.emit({ type: "review", pass: verdict.pass, issues: verdict.issues });
 		return verdict;
 	}
 
@@ -836,21 +978,24 @@ export class Engine {
 			role: "director",
 			llm: this.llm,
 			system: REPORT_SYSTEM,
-			tools: [...sharedReadTools(this.store), sceneReportTool(collector)],
-			prompt: assembleDirectorReportPrompt(this.state, sceneText),
+			tools: [sceneReportTool(collector)], // 快照/经济/伏笔已内联进 prompt，单次提交
+			prompt: await assembleDirectorReportPrompt(this.store, this.state, sceneText),
 			onProcess: this.proc("director", true),
 		});
 		return collector.report ?? null;
 	}
 
 	private async persistReport(raw: SceneReport): Promise<SceneReport> {
-		// 报告门禁：未知角色补丁/流水丢弃、金额钳制、choices 复验、摘要截断（全部确定性）
+		// 报告门禁：未知角色补丁/流水/实体丢弃、金额钳制、choices 复验、摘要截断（全部确定性）
 		const cards = await this.store.loadCharacters();
-		const { report, warnings } = sanitizeReport(raw, cards.map((c) => c.name));
+		const entities = await this.store.loadEntities();
+		const { report, warnings } = sanitizeReport(raw, cards.map((c) => c.name), entities.map((e) => e.name));
 		for (const w of warnings) this.emit({ type: "status", text: `报告门禁：${w}` });
 		await this.store.saveSceneSummary(this.state.sceneIndex, report);
 		await applyCharacterPatches(this.store, report.characterUpdates);
-		await applyForeshadowOps(this.store, report.foreshadowOps, this.state.sceneIndex);
+		await applyEntityPatches(this.store, report.entityUpdates ?? []);
+		const foreshadowWarnings = await applyForeshadowOps(this.store, report.foreshadowOps, this.state.sceneIndex);
+		for (const w of foreshadowWarnings) this.emit({ type: "status", text: `伏笔提醒：${w}` });
 		// 经济结算：余额由代码记账，LLM 只申报流水
 		const financeWarnings = await applyTransactions(this.store, this.state.sceneIndex, report.transactions ?? []);
 		for (const w of financeWarnings) {
@@ -882,11 +1027,19 @@ export class Engine {
 	}
 
 	async save(name: string): Promise<void> {
+		if (!SAVE_NAME_RE.test(name)) {
+			this.emit({ type: "error", message: "存档名只能含中文、字母、数字、_ 或 -，长度 ≤64" });
+			return;
+		}
 		await this.store.writeJson(`存档/${name}.json`, this.state);
 		this.emit({ type: "status", text: `已存档：${name}` });
 	}
 
 	async restart(): Promise<void> {
+		if (this.pipelineBusy) {
+			this.emit({ type: "error", message: "引擎正在推进剧情（写作/校对/结算中），请稍后再重启。" });
+			return;
+		}
 		this.state = Engine.initialState();
 		await this.commit();
 		this.emit({ type: "status", text: "已重置。输入故事灵感开始新故事。" });

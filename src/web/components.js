@@ -340,7 +340,8 @@
     }
     set src(md) {
       if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
-        this.innerHTML = DOMPurify.sanitize(marked.parse(String(md)));
+        // breaks: 单个换行也渲染成 <br>——模型偶尔忘写空行时段落不至于被吞成一块
+        this.innerHTML = DOMPurify.sanitize(marked.parse(String(md), { breaks: true, gfm: true }));
       } else {
         this.textContent = String(md); // 组件库缺失时降级
       }

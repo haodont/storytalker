@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Store } from '../facts/store.js';
-import type { CharacterState, ForeshadowOp, GameState, LedgerEntry, SceneReport } from '../facts/types.js';
+import type { CharacterState, ForeshadowOp, GameState, LedgerEntry, SceneReport, WorldEntity } from '../facts/types.js';
 
 // -- 报告门禁（确定性，零 LLM）：落盘前拦截 Director 报告中的幻觉 ---------------
 
@@ -29,9 +29,16 @@ function dedupeAppend(base: string[], add: string[]): string[] {
  * 场景报告门禁：未知角色补丁丢弃、流水名字校验与金额钳制、choices 复验、摘要截断。
  * 返回清理后的报告与告警（引擎转成 status 事件）。
  */
-export function sanitizeReport(report: SceneReport, knownNames: string[]): { report: SceneReport; warnings: string[] } {
+export function sanitizeReport(report: SceneReport, knownNames: string[], knownEntities: string[] = []): { report: SceneReport; warnings: string[] } {
 	const warnings: string[] = [];
 	const known = new Set(knownNames);
+	const knownEntity = new Set(knownEntities);
+
+	const entityUpdates = (report.entityUpdates ?? []).filter((u) => {
+		if (knownEntity.has(u.name) && u.patch && Object.keys(u.patch).length > 0) return true;
+		warnings.push(`实体补丁指向未注册实体「${u.name}」，已丢弃（实体在设计时注册，运行中不可凭空新增）`);
+		return false;
+	});
 
 	const characterUpdates = report.characterUpdates.filter((u) => {
 		if (known.has(u.name)) return true;
@@ -71,6 +78,7 @@ export function sanitizeReport(report: SceneReport, knownNames: string[]): { rep
 			summary: report.summary.slice(0, SUMMARY_MAX),
 			characterUpdates,
 			transactions,
+			entityUpdates,
 			choices,
 			recommendedChoice: recommended,
 		},
@@ -151,21 +159,52 @@ export async function applyCharacterPatches(store: Store, updates: { name: strin
 	}
 }
 
-export async function applyForeshadowOps(store: Store, ops: ForeshadowOp[], sceneIndex: number): Promise<void> {
+/** 实体状态合并：数字保留数字（供代码结算/趋势），字符串保留字符串 */
+export async function applyEntityPatches(store: Store, updates: { name: string; patch: Record<string, string | number> }[]): Promise<void> {
+	if (updates.length === 0) return;
+	const entities = await store.loadEntities();
+	for (const { name, patch } of updates) {
+		const e = entities.find((x) => x.name === name);
+		if (!e) continue; // 已由门禁过滤，此处兜底
+		const state: Record<string, string | number> = { ...e.state };
+		for (const [k, v] of Object.entries(patch)) {
+			if (v === null || v === undefined) continue;
+			if (typeof v === "number" && !Number.isFinite(v)) continue;
+			state[k] = v;
+		}
+		e.state = state;
+	}
+	await store.saveEntities(entities);
+}
+
+export async function applyForeshadowOps(store: Store, ops: ForeshadowOp[], sceneIndex: number): Promise<string[]> {
+	const warnings: string[] = [];
 	const entries = await store.loadForeshadows();
 	for (const op of ops) {
 		if (op.action === "plant") {
 			const id = op.id ?? `F${String(sceneIndex).padStart(3, "0")}-${String(entries.length + 1).padStart(2, "0")}`;
-			if (!entries.some((e) => e.id === id)) {
-				entries.push({ id, description: op.description ?? "", plantedAtScene: sceneIndex, status: "open", notes: op.note ? [op.note] : [] });
+			const existing = entries.find((e) => e.id === id);
+			if (existing) {
+				warnings.push(`伏笔「${id}」已被埋设于场景${existing.plantedAtScene}，重复 plant 已忽略`);
+				continue;
 			}
+			entries.push({ id, description: op.description ?? "", plantedAtScene: sceneIndex, status: "open", notes: op.note ? [op.note] : [] });
 		} else {
 			const target = entries.find((e) => e.id === op.id);
-			if (target) {
-				if (op.action === "resolve") target.status = "resolved";
-				target.notes = [...(target.notes ?? []), ...(op.note ? [`场景${sceneIndex}: ${op.note}`] : [])];
+			if (!target) {
+				warnings.push(`伏笔操作「${op.action}」指向未注册的伏笔 ID「${op.id}」，已忽略`);
+				continue;
 			}
+			if (op.action === "resolve") {
+				if (target.status === "resolved") {
+					warnings.push(`伏笔「${op.id}」已被回收过，重复 resolve 已忽略`);
+					continue;
+				}
+				target.status = "resolved";
+			}
+			target.notes = [...(target.notes ?? []), ...(op.note ? [`场景${sceneIndex}: ${op.note}`] : [])];
 		}
 	}
 	await store.saveForeshadows(entries);
+	return warnings;
 }

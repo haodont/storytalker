@@ -59,6 +59,10 @@ async function main(): Promise<void> {
 	check("分叉新会话", forkRes.ok === true);
 	const sess = (await (await fetch(auth("/api/sessions"))).json()) as string[];
 	check("会话列表含分支", sess.includes("fork-e2e"));
+	const worlds = (await (await fetch(auth("/api/worlds"))).json()) as { id: string; title: string; phase: string }[];
+	check("世界列表含 main 与分支", worlds.some((w) => w.id === "main") && worlds.some((w) => w.id === "fork-e2e" && w.phase === "confirm_bible"));
+	const forkSaves = (await (await fetch(auth("/api/saves") + "&session=fork-e2e")).json()) as { name: string; parent: string | null }[];
+	check("存档列表带谱系字段", Array.isArray(forkSaves) && forkSaves.every((s) => typeof s.name === "string" && (s.parent === null || typeof s.parent === "string")));
 	const forkState = (await (await fetch(auth("/api/state") + "&session=fork-e2e")).json()) as { state: { phase: string; sceneIndex: number } };
 	check("分支继承进度", forkState.state.phase === "confirm_bible");
 	const evilFork = await fetch(auth("/api/command"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cmd: "fork:../evil" }) });
@@ -73,7 +77,7 @@ async function main(): Promise<void> {
 	// 6) 事件流断言
 	const events = (await (await fetch(auth("/api/events.json"))).json()) as { type: string; text?: string }[];
 	const types = events.map((e) => e.type);
-	check("SSE 事件含 scene_done ×10", types.filter((t) => t === "scene_done").length === 10);
+	check("SSE 事件含 scene_done ×20（两弧）", types.filter((t) => t === "scene_done").length === 20);
 	check("SSE 事件含 choices", types.includes("choices"));
 	check("SSE 事件含 boot_ready", types.includes("boot_ready"));
 	// 流式增量应已被合并：全文日志里 scene_delta 条数应远小于逐字数量，

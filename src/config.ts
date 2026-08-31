@@ -32,8 +32,8 @@ export const ROLE_MODELS: Record<RoleName, { modelId: string; temperature: numbe
 export const ENGINE = {
 	/** 每弧场景数（v1 验证用短篇默认 10） */
 	scenesPerArc: 10,
-	/** Reviewer 打回重写上限 */
-	maxRewrites: 2,
+	/** 弧数上限：弧边界导播可续弧，达上限强制收束（防无限续写） */
+	maxArcs: Number(process.env.NOVEL_MAX_ARCS ?? 3),
 	/** Writer 上下文携带的最近场景摘要数 */
 	recentSummaries: 3,
 	/** 上一场景原文尾部携带的字符数 */
