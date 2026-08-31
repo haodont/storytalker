@@ -11,7 +11,8 @@ import type { GameState } from "../facts/types.js";
 // 防止上下文溢出小窗口，也防止 LLM 对被截断处产生"遗忘幻觉"。
 // ---------------------------------------------------------------------------
 
-const CAP = {
+// 各层字符上限基准（按 16k contextWindow 校准；中文 ≈1 字 1 token）
+const BASE_CAP = {
 	masterOutline: 1200, // 总纲
 	arcSummary: 1200, // 此前各弧摘要
 	recentSummaries: 1400, // 近期场景摘要（总长）
@@ -20,7 +21,36 @@ const CAP = {
 	foreshadows: 500, // 未回收伏笔
 	economy: 500, // 经济体系
 	choices: 240, // 读者上次选择
-};
+} as const;
+
+export type Caps = Record<keyof typeof BASE_CAP, number>;
+
+/** 由模型窗口推导各层上限：scale 夹在 [0.5, 4]，防小窗口溢出、大窗口铺张。
+ *  16k 时与历史硬编码值完全一致（行为等价）。非法输入回退 16k 基准。 */
+export function capsFor(contextWindow: number): Caps {
+	const win = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 16384;
+	const scale = Math.min(4, Math.max(0.5, win / 16384));
+	const out = {} as Caps;
+	for (const k of Object.keys(BASE_CAP) as (keyof typeof BASE_CAP)[]) {
+		out[k] = Math.round(BASE_CAP[k] * scale);
+	}
+	return out;
+}
+
+const DEFAULT_CAPS = capsFor(16384);
+
+/** 当前生效上限：engine 在 boot/updateSettings 时按实际模型窗口刷新 */
+let activeCaps: Caps = DEFAULT_CAPS;
+
+/** 按当前模型 contextWindow 刷新各层上限（engine 调用；不传则回 16k 基准） */
+export function setActiveContextWindow(contextWindow: number): void {
+	activeCaps = Number.isFinite(contextWindow) && contextWindow > 0 ? capsFor(contextWindow) : DEFAULT_CAPS;
+}
+
+/** 读取当前生效的各层上限 */
+function CAP(): Caps {
+	return activeCaps;
+}
 
 /** 超限截断：保留头部（时间线靠后的层由调用方保证已取"最近"），并标注省略 */
 function clip(text: string, max: number): string {
@@ -50,10 +80,10 @@ export async function assembleWriterPrompt(store: Store, state: GameState): Prom
 	const parts: string[] = [];
 
 	const masterOutline = await store.readText("大纲/总纲.md");
-	if (masterOutline) parts.push(`## 故事总纲\n${clip(masterOutline, CAP.masterOutline)}`);
+	if (masterOutline) parts.push(`## 故事总纲\n${clip(masterOutline, CAP().masterOutline)}`);
 
 	const arcSummary = await store.readText("记忆/弧摘要.md");
-	if (arcSummary) parts.push(`## 此前各弧摘要\n${clip(arcSummary, CAP.arcSummary)}`);
+	if (arcSummary) parts.push(`## 此前各弧摘要\n${clip(arcSummary, CAP().arcSummary)}`);
 
 	if (state.arc) parts.push(`## 本弧目标（方向约束，不要在这一场全部完成）\n${state.arc.goal}`);
 
@@ -72,7 +102,7 @@ export async function assembleWriterPrompt(store: Store, state: GameState): Prom
 		for (let i = summaries.length - 1; i >= 0; i--) {
 			const s = summaries[i]!;
 			const line = `- 场景${s.scene}「${s.title}」：${clip(s.summary, 300)}`;
-			if (used + line.length > CAP.recentSummaries) break;
+			if (used + line.length > CAP().recentSummaries) break;
 			lines.unshift(line);
 			used += line.length;
 		}
@@ -93,14 +123,14 @@ export async function assembleWriterPrompt(store: Store, state: GameState): Prom
 			`## 角色档案（含当前状态快照）\n${chosen
 				.map((c) => {
 					const emo = c.state.emotions?.length ? `\n最近情感轨迹：${c.state.emotions.slice(-4).join("；")}` : "";
-					return `### ${c.name}\n${clip(c.basics, 300)}\n当前状态：${clip(JSON.stringify(c.state), CAP.characterCard)}${emo}`;
+					return `### ${c.name}\n${clip(c.basics, 300)}\n当前状态：${clip(JSON.stringify(c.state), CAP().characterCard)}${emo}`;
 				})
 				.join("\n\n")}`,
 		);
 	}
 
 	const economy = await store.loadEconomy();
-	if (economy) parts.push(`## 经济体系（涉及金钱、交易、谋生时必须遵守；余额是引擎结算的事实，不可凭空变多或清零）\n${clip(economy, CAP.economy)}`);
+	if (economy) parts.push(`## 经济体系（涉及金钱、交易、谋生时必须遵守；余额是引擎结算的事实，不可凭空变多或清零）\n${clip(economy, CAP().economy)}`);
 
 	const foreshadows = (await store.loadForeshadows()).filter((f) => f.status === "open");
 	if (foreshadows.length > 0) {
@@ -132,7 +162,7 @@ export async function assembleReviewerPrompt(store: Store, state: GameState, dra
 	if (rules) parts.push(`### 世界规则\n${rules}`);
 
 	const economy = await store.loadEconomy();
-	if (economy) parts.push(`### 经济体系（约束：收支与消费必须与之相符）\n${clip(economy, CAP.economy)}`);
+	if (economy) parts.push(`### 经济体系（约束：收支与消费必须与之相符）\n${clip(economy, CAP().economy)}`);
 
 	const cards = await store.loadCharacters();
 	if (cards.length > 0) {
@@ -148,12 +178,12 @@ export async function assembleReviewerPrompt(store: Store, state: GameState, dra
 
 	const foreshadows = (await store.loadForeshadows()).filter((f) => f.status === "open");
 	if (foreshadows.length > 0) {
-		parts.push(`### 未回收伏笔（约束：不可凭空说破）\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP.foreshadows)}`);
+		parts.push(`### 未回收伏笔（约束：不可凭空说破）\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP().foreshadows)}`);
 	}
 
 	const summaries = await store.recentSummaries(state.sceneIndex, ENGINE.recentSummaries);
 	if (summaries.length > 0) {
-		parts.push(`### 近期剧情摘要（约束：不得矛盾）\n${clip(summaries.map((s) => `- 场景${s.scene}：${s.summary}`).join("\n"), CAP.recentSummaries)}`);
+		parts.push(`### 近期剧情摘要（约束：不得矛盾）\n${clip(summaries.map((s) => `- 场景${s.scene}：${s.summary}`).join("\n"), CAP().recentSummaries)}`);
 	}
 
 	// d20 判定日志：草稿对成败的叙述必须与骰子结果一致
@@ -195,7 +225,7 @@ export async function assembleDirectorReportPrompt(store: Store, state: GameStat
 	}
 
 	const economy = await store.loadEconomy();
-	if (economy) parts.push(`## 经济体系（涉及收支时逐笔写入 transactions）\n${clip(economy, CAP.economy)}`);
+	if (economy) parts.push(`## 经济体系（涉及收支时逐笔写入 transactions）\n${clip(economy, CAP().economy)}`);
 
 	const foreshadows = (await store.loadForeshadows()).filter((f) => f.status === "open");
 	if (foreshadows.length > 0) {
@@ -255,7 +285,7 @@ export async function assembleOutlineDerivationPrompt(store: Store, state: GameS
 		for (let i = summaries.length - 1; i >= 0; i--) {
 			const s = summaries[i]!;
 			const line = `- 场景${s.scene}「${s.title}」：${clip(s.summary, 300)}`;
-			if (used + line.length > CAP.recentSummaries) break;
+			if (used + line.length > CAP().recentSummaries) break;
 			lines.unshift(line);
 			used += line.length;
 		}
@@ -276,7 +306,7 @@ export async function assembleOutlineDerivationPrompt(store: Store, state: GameS
 
 	const foreshadows = (await store.loadForeshadows()).filter((f) => f.status === "open");
 	if (foreshadows.length > 0) {
-		parts.push(`## 未回收伏笔（推演时可自然推进其一，不可凭空说破）\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP.foreshadows)}`);
+		parts.push(`## 未回收伏笔（推演时可自然推进其一，不可凭空说破）\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP().foreshadows)}`);
 	}
 
 	parts.push(
@@ -293,7 +323,7 @@ export async function assembleOutlineReviewPrompt(store: Store, state: GameState
 	const rules = await store.readText("设定/规则.md");
 	if (rules) parts.push(`### 世界规则\n${clip(rules, 1000)}`);
 	const economy = await store.loadEconomy();
-	if (economy) parts.push(`### 经济体系（大纲涉及收支时核对）\n${clip(economy, CAP.economy)}`);
+	if (economy) parts.push(`### 经济体系（大纲涉及收支时核对）\n${clip(economy, CAP().economy)}`);
 
 	const cards = await store.loadCharacters();
 	if (cards.length > 0) {
@@ -309,12 +339,12 @@ export async function assembleOutlineReviewPrompt(store: Store, state: GameState
 
 	const foreshadows = (await store.loadForeshadows()).filter((f) => f.status === "open");
 	if (foreshadows.length > 0) {
-		parts.push(`### 未回收伏笔\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP.foreshadows)}`);
+		parts.push(`### 未回收伏笔\n${clip(foreshadows.map((f) => `- [${f.id}] ${f.description}`).join("\n"), CAP().foreshadows)}`);
 	}
 
 	const summaries = await store.recentSummaries(state.sceneIndex, ENGINE.recentSummaries);
 	if (summaries.length > 0) {
-		parts.push(`### 近期剧情摘要\n${clip(summaries.map((s) => `- 场景${s.scene}：${s.summary}`).join("\n"), CAP.recentSummaries)}`);
+		parts.push(`### 近期剧情摘要\n${clip(summaries.map((s) => `- 场景${s.scene}：${s.summary}`).join("\n"), CAP().recentSummaries)}`);
 	}
 
 	const history = await store.readText("记忆/选择历史.jsonl");

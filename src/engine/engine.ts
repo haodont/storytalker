@@ -1,138 +1,21 @@
-import { ENGINE } from "../config.js";
+import { ENGINE, defaultLlmSettings, normalizeLlm, validateLlm } from "../config.js";
 import { runAgent } from "../agents/agents.js";
 import { arcRevisionTool, arcPlanTool, designStoryTool, d20CheckTool, memoryDistillTool, saveHistoryNotesTool, sceneOutlineTool, sceneReportTool, sharedReadTools, verdictTool, webSearchTool, type ToolCollector } from "../agents/tools.js";
 import { ARC_PLAN_SYSTEM, DESIGN_SYSTEM, DISTILL_SYSTEM, IDEA_SYSTEM, OUTLINE_SYSTEM, REPORT_SYSTEM, REVIEWER_SYSTEM, WRITER_SYSTEM } from "../agents/prompts.js";
 import type { Store } from "../facts/store.js";
 import type { GameState, PlayMode, RuntimeSettings, SceneReport, StoryDesign } from "../facts/types.js";
-import type { Llm } from "../llm.js";
+import { createLlm, specFromSettings, type Llm } from "../llm.js";
 import { assembleArcPlanPrompt, assembleBootPrompt, assembleDirectorReportPrompt, assembleMemoryDistillPrompt, assembleArcDistillPrompt, assembleOutlineDerivationPrompt, assembleOutlineReviewPrompt, assembleReviewerPrompt, assembleWriterPrompt, draftPrecheckNotes, extractCurrency } from "./context.js";
 import { applyCharacterPatches, applyEntityPatches, applyForeshadowOps, applyTransactions, sanitizeReport } from "./settle.js";
-
-// ---------------------------------------------------------------------------
-// 确定性复读检测：小模型可能陷入 n-gram 循环并耗尽 token 预算。
-// 不花任何 LLM 调用，直接在草稿上查滑动窗口的重复块。
-// ---------------------------------------------------------------------------
-export function detectRepetitionLoop(draft: string): { quote: string; constraint: string; problem: string }[] {
-	const window = 24; // 连续 24 字为一块
-	const minRepeat = 4; // 同一块出现 ≥4 次视为复读
-	if (draft.length < window * (minRepeat + 1)) return [];
-	const counts = new Map<string, number>();
-	for (let i = 0; i + window <= draft.length; i++) {
-		const key = draft.slice(i, i + window);
-		counts.set(key, (counts.get(key) ?? 0) + 1);
-	}
-	let worst = "";
-	let worstCount = 0;
-	for (const [key, count] of counts) {
-		if (count > worstCount) {
-			worst = key;
-			worstCount = count;
-		}
-	}
-	if (worstCount < minRepeat) return [];
-	return [
-		{
-			quote: worst,
-			constraint: "文本复读检测",
-			problem: `同一片段「${worst.slice(0, 12)}…」在草稿中重复出现 ${worstCount} 次，陷入复读循环；请重写整个场景，推进剧情而不是原地重复。`,
-		},
-	];
-}
-
-// ---------------------------------------------------------------------------
-// 确定性门禁：大纲预检 / 开局设计校验。纯函数、零 LLM，幻觉在落盘前被拦截。
-// ---------------------------------------------------------------------------
-
-const OUTLINE_MIN = 80;
-const OUTLINE_MAX = 600;
-
-/** 大纲硬性预检：字数出格直接打回（不劳 LLM 审核） */
-export function outlineGateHard(outline: string): { quote: string; constraint: string; problem: string }[] {
-	if (outline.length >= OUTLINE_MIN && outline.length <= OUTLINE_MAX) return [];
-	return [
-		{
-			quote: outline.slice(0, 30),
-			constraint: "大纲规格（80-600 字）",
-			problem: `大纲长度 ${outline.length} 字，超出规格；请${outline.length < OUTLINE_MIN ? "充实每个节点的信息增量" : "压缩过程细节、保留节点骨架"}后重新提交。`,
-		},
-	];
-}
-
-/** 从读者选择文本提取关键词（按标点切分，取 ≥2 字的段），用于承接性检查 */
-function choiceKeywords(choice: string): string[] {
-	return choice
-		.split(/[——…、，。;；!？?！:：\s()（）「」《》"'·]+/)
-		.map((s) => s.trim())
-		.filter((s) => s.length >= 2);
-}
-
-/** 大纲软性预检：疑点提示喂给审核，不直接打回 */
-export function outlineGateNotes(outline: string, lastChoice: string | null): string[] {
-	const notes: string[] = [];
-	if (lastChoice) {
-		const kws = choiceKeywords(lastChoice);
-		if (kws.length > 0 && !kws.some((k) => outline.includes(k))) {
-			notes.push(`读者上一选择「${lastChoice}」在大纲中找不到明显呼应——请核对承接性，若确实未承接应打回。`);
-		}
-	}
-	return notes;
-}
-
-/** 大纲中已登记角色的出场情况（给审核做「未登记名扫描」的参考面） */
-export function outlineCastNote(outline: string, knownNames: string[]): string | null {
-	const present = knownNames.filter((n) => n.length >= 2 && outline.includes(n));
-	if (present.length === 0) return null;
-	return `大纲提及的已登记角色：${present.join("、")}。其余出场人物若需具名，须是已登记角色或无名指代（如「店主」）。`;
-}
-
-/** 开局设计校验：可确定性修复前的硬伤清单（供一轮 LLM 修复） */
-export function designIssues(design: StoryDesign): string[] {
-	const issues: string[] = [];
-	if (!design.title?.trim()) issues.push("书名（title）为空");
-	if (!design.premise?.trim()) issues.push("故事梗概（premise）为空");
-	if (!design.worldRules?.trim()) issues.push("世界规则（worldRules）为空");
-	if (!design.economy?.currency?.trim()) issues.push("经济体系的计价单位（economy.currency）为空");
-	if (!design.economy?.overview?.trim()) issues.push("经济体系概述（economy.overview）为空");
-	if (!design.arc?.title?.trim() || !design.arc?.goal?.trim()) issues.push("第一弧的标题或目标为空");
-	if (!design.openingBeat?.trim()) issues.push("开场拍（openingBeat）为空");
-	if (!Array.isArray(design.characters) || design.characters.length < 2) issues.push("主要角色少于 2 个");
-	if (!Array.isArray(design.attributes) || design.attributes.length < 4 || design.attributes.length > 8) {
-		issues.push(`世界属性表需要 4-8 条（当前 ${design.attributes?.length ?? 0} 条）`);
-	}
-	return issues;
-}
-
-/** 开局设计修复：属性表裁剪、stats 键对齐属性表并补默认值。返回告警。 */
-export function sanitizeDesign(design: StoryDesign): { design: StoryDesign; warnings: string[] } {
-	const warnings: string[] = [];
-	let attributes = (design.attributes ?? []).map((a) => a?.trim()).filter(Boolean);
-	if (attributes.length > 8) {
-		attributes = attributes.slice(0, 8);
-		warnings.push("属性表超过 8 条，已截断");
-	}
-	if (attributes.length > 0) {
-		const attrSet = new Set(attributes);
-		const characters = design.characters.map((c) => {
-			const raw = c.initialState.stats;
-			if (!raw) return c;
-			const dropped = Object.keys(raw).filter((k) => !attrSet.has(k));
-			const stats: Record<string, number> = {};
-			for (const k of attributes) stats[k] = typeof raw[k] === "number" ? Math.min(18, Math.max(1, Math.round(raw[k]))) : 10;
-			if (dropped.length > 0) warnings.push(`${c.name} 的属性键 [${dropped.join("、")}] 不在属性表中，已按属性表重排（缺省 10）`);
-			return { ...c, initialState: { ...c.initialState, stats } };
-		});
-		return { design: { ...design, attributes, characters }, warnings };
-	}
-	return { design: { ...design, attributes }, warnings };
-}
+import { detectRepetitionLoop, designIssues, outlineCastNote, outlineGateHard, outlineGateNotes, sanitizeDesign } from "./validate.js";
+import { initialState as initialGameState, normalizeState } from "./state.js";
+import { setActiveContextWindow } from "./context.js";
 
 // ---------------------------------------------------------------------------
 // 确定性场景引擎：状态机主循环零 LLM 逻辑，LLM 只在角色调用中发生。
 // 每个状态变更后原子落盘 autosave，进程崩溃后可从 current.json 恢复。
+// 状态工厂/归一化在 state.ts，确定性校验在 validate.ts。
 // ---------------------------------------------------------------------------
-
-/** GameState 结构版本：加字段/改语义时递增，restoreOrEmpty 的 normalizeState 兜底 */
-const CURRENT_SCHEMA_VERSION = 2;
 
 /** 存档名白名单（存档/与 分叉入档共用）：字母数字_- 与中文，防路径逃逸 */
 const SAVE_NAME_RE = /^[\w一-鿿-]{1,64}$/;
@@ -156,17 +39,27 @@ export type EngineEvent =
 	| { type: "error"; message: string };
 
 export class Engine {
-	private state: GameState = Engine.initialState();
+	private state: GameState = initialGameState();
 	private currentSteer: ((text: string) => void) | null = null;
 
 	/** 运行时设置（boot 时从工作区加载，设置界面热更新） */
-	settings: RuntimeSettings = { scenesPerArc: ENGINE.scenesPerArc, maxArcs: ENGINE.maxArcs, webSearch: true };
+	settings: RuntimeSettings = { scenesPerArc: ENGINE.scenesPerArc, maxArcs: ENGINE.maxArcs, webSearch: true, llm: defaultLlmSettings() };
 
 	constructor(
 		public readonly store: Store,
-		private readonly llm: Llm,
+		private llm: Llm,
 		public emit: (event: EngineEvent) => void,
 	) {}
+
+	/** 按当前模型窗口刷新上下文各层 CAP（取三角色最小窗口，保证任何角色都不溢出） */
+	private syncCaps(): void {
+		try {
+			const wins = (["director", "writer", "reviewer"] as const).map((r) => this.llm.model(r).contextWindow);
+			setActiveContextWindow(Math.min(...wins));
+		} catch {
+			// 模型缺失等异常：保持 16k 基准（capsFor 的默认）
+		}
+	}
 
 	/** 更新运行时设置：校验→落盘→生效（下一场景循环即用新值）。返回错误信息（null=成功） */
 	async updateSettings(patch: Partial<RuntimeSettings>): Promise<string | null> {
@@ -182,27 +75,22 @@ export class Engine {
 			next.maxArcs = n;
 		}
 		if (patch.webSearch !== undefined) next.webSearch = Boolean(patch.webSearch);
+		if (patch.llm !== undefined) {
+			const llm = normalizeLlm(patch.llm);
+			const err = validateLlm(llm);
+			if (err) return err;
+			next.llm = llm;
+			// 热重建 LLM 接入：下一角色调用即使用新服务商（在途调用仍用旧接入，无害）
+			this.llm = createLlm(specFromSettings(llm));
+			this.syncCaps();
+		}
 		this.settings = next;
 		await this.store.saveSettings(next);
-		this.emit({ type: "status", text: `设置已更新：每弧 ${next.scenesPerArc} 场 · 弧上限 ${next.maxArcs} · 联网查证${next.webSearch ? "开" : "关"}` });
+		this.emit({
+			type: "status",
+			text: `设置已更新：每弧 ${next.scenesPerArc} 场 · 弧上限 ${next.maxArcs} · 联网查证${next.webSearch ? "开" : "关"}${next.llm ? ` · 模型[${next.llm.provider}:${next.llm.modelId}]` : ""}`,
+		});
 		return null;
-	}
-
-	static initialState(): GameState {
-		return {
-			phase: "empty",
-			mode: "manual",
-			title: "",
-			premise: "",
-			sceneIndex: 0,
-			arcBeatIndex: 0,
-			arc: null,
-			arcCount: 1,
-			pendingReport: null,
-			ideaMsgs: [],
-			schemaVersion: CURRENT_SCHEMA_VERSION,
-			updatedAt: new Date().toISOString(),
-		};
 	}
 
 	get gameState(): GameState {
@@ -242,6 +130,13 @@ export class Engine {
 	private void(p: Promise<void>): void {
 		p.catch((err) => {
 			this.pipelineBusy = false; // 出错必须解除互斥，否则 restart/load 被永久挡住
+			this.clearControl();
+			if (this.aborting || (err instanceof Error && err.message.includes("被中止"))) {
+				// 用户主动中断：非错误，回到稳定态即可
+				this.aborting = false;
+				this.emit({ type: "status", text: "已中断本次生成，进度停留在上一个稳定点。" });
+				return;
+			}
 			this.emit({ type: "error", message: `引擎错误：${err?.message ?? err}` });
 		});
 	}
@@ -260,6 +155,7 @@ export class Engine {
 	async boot(): Promise<void> {
 		await this.store.ensureWorkspace();
 		this.settings = await this.store.loadSettings();
+		this.syncCaps();
 		const saved = await this.store.readJson<GameState>("存档/current.json");
 		if (saved && saved.phase === "ended") {
 			// 上局已完结：以空局进入，但保留完结信息提示
@@ -273,7 +169,7 @@ export class Engine {
 	/** 从状态快照恢复（boot 与 load 共用）；空快照则进入空局。旧版本存档在此统一归一化 */
 	private async restoreOrEmpty(saved: GameState | null): Promise<void> {
 		if (saved && saved.phase !== "empty" && saved.phase !== "ended") {
-			this.state = Engine.normalizeState(saved);
+			this.state = normalizeState(saved);
 			this.emit({ type: "phase", phase: saved.phase });
 			this.emit({ type: "status", text: `已恢复进度：${saved.title || "未命名"}，第 ${saved.sceneIndex} 场` });
 			if (saved.phase === "playing" && saved.pendingReport) {
@@ -320,23 +216,9 @@ export class Engine {
 		}
 	}
 
-	/** 存档归一化：旧版本快照缺字段时补默认值（新增字段一律在此兜底，替代散点补丁） */
-	static normalizeState(saved: GameState): GameState {
-		return {
-			...saved,
-			schemaVersion: CURRENT_SCHEMA_VERSION,
-			title: saved.title ?? "",
-			premise: saved.premise ?? "",
-			sceneIndex: saved.sceneIndex ?? 0,
-			arcBeatIndex: saved.arcBeatIndex ?? 1,
-			arcCount: saved.arcCount ?? 1,
-			pendingReport: saved.pendingReport ?? null,
-			ideaMsgs: saved.ideaMsgs ?? [],
-		};
-	}
-
 	/** 存档位列表（不含 autosave 的 current.json；parent 构成存档树） */
 	async listSaves(): Promise<{ name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[]> {
+		// 降级是有意为之：存档目录可能尚未创建（全新世界），此时视为无存档，非吞错
 		const files = await this.store.listDir("存档").catch(() => [] as string[]);
 		const out: { name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[] = [];
 		for (const f of files.filter((x) => x.endsWith(".json") && x !== "current.json")) {
@@ -366,8 +248,8 @@ export class Engine {
 		this.currentSteer = null;
 		this.ideaBusy = false;
 		if (saved.phase === "ended") {
-			this.state = Engine.normalizeState(saved);
-			this.emit({ type: "phase", phase: "ended" });
+		this.state = normalizeState(saved);
+		this.emit({ type: "phase", phase: "ended" });
 			this.emit({ type: "status", text: `已读档：《${saved.title || "未命名"}》（已完结，可回看；/restart 开新故事）` });
 			return;
 		}
@@ -382,6 +264,38 @@ export class Engine {
 
 	/** d20 判定硬预算：每场重置（约束在代码，不在 prompt） */
 	private diceBudget = { used: 0, max: 3 };
+
+	/** 当前在途 LLM 调用的中止句柄（runAgent onStart 挂入，正常结束/出错即清除） */
+	private currentAbort: (() => void) | null = null;
+
+	/** 用户主动中断标志：让 void() 把中止识别为正常操作而非引擎错误 */
+	private aborting = false;
+
+	/** 中断当前生成：流式调用以 aborted 收尾，引擎回到上一个稳定态（中断点由存档恢复机制兜底） */
+	abortGeneration(): boolean {
+		if (!this.currentAbort) return false;
+		this.aborting = true;
+		const abort = this.currentAbort;
+		this.currentAbort = null;
+		abort();
+		this.emit({ type: "status", text: "正在中断生成……" });
+		return true;
+	}
+
+	/** runAgent 的 onStart 统一挂钩：登记 steer/abort 句柄 */
+	private grabControl() {
+		return (control: { steer: (text: string) => void; abort: () => void }) => {
+			this.currentSteer = control.steer;
+			this.currentAbort = control.abort;
+		};
+	}
+
+	/** 调用结束（正常/异常）后清句柄并复位中断标志 */
+	private clearControl(): void {
+		this.currentSteer = null;
+		this.currentAbort = null;
+		this.aborting = false;
+	}
 
 	/** 灵感酝酿阶段：与导播多轮对话打磨题材，不触发正式设计 */
 	async chatIdea(text: string): Promise<void> {
@@ -407,6 +321,7 @@ export class Engine {
 				tools: [],
 				prompt,
 				onProcess: this.proc("director", true),
+				onStart: this.grabControl(),
 			});
 			const reply = result.text.trim() || "（导播走神了一下，再说一遍？）";
 			this.state.ideaMsgs.push({ role: "assistant", text: reply });
@@ -446,6 +361,7 @@ export class Engine {
 				tools: [...sharedReadTools(this.store), designStoryTool(this.store, collector)],
 				prompt: `你提交的开局设计未通过程序预检：\n${issues.map((i, n) => `${n + 1}. ${i}`).join("\n")}\n\n请调用 design_story 重新提交修复后的完整设计（保持原题材与风格，只修复列出的问题）。`,
 				onProcess: this.proc("director", true),
+				onStart: this.grabControl(),
 			});
 			if (collector.design) current = collector.design;
 		}
@@ -478,6 +394,7 @@ export class Engine {
 			tools: [...sharedReadTools(this.store), ...(this.settings.webSearch ? [webSearchTool(), saveHistoryNotesTool(this.store)] : []), designStoryTool(this.store, collector)],
 			prompt: assembleBootPrompt(premise),
 			onProcess: this.proc("director", true),
+			onStart: this.grabControl(),
 		});
 
 		if (!collector.design) {
@@ -518,6 +435,7 @@ export class Engine {
 			tools: [...sharedReadTools(this.store), ...(this.settings.webSearch ? [webSearchTool(), saveHistoryNotesTool(this.store)] : []), designStoryTool(this.store, collector)],
 			prompt: `读者对现有开局设计提出了修改意见：「${feedback}」\n\n请调用 read_bible 查看现有设定后，调用 design_story 重新提交完整开局设计（在原有基础上按意见调整）。`,
 			onProcess: this.proc("director", true),
+			onStart: this.grabControl(),
 		});
 		if (collector.design) {
 			const design = await this.validateDesign(collector.design);
@@ -563,6 +481,7 @@ export class Engine {
 				tools: [...sharedReadTools(this.store), arcRevisionTool(this.store, collector, this.state.arcCount)],
 				prompt: `读者对当前弧大纲提出调整意见：「${feedback}」\n\n当前是第 ${this.state.arcCount} 弧「${this.state.arc.title}」，目标：${this.state.arc.goal}\n\n请先用 read_bible / search_story 了解设定与已有剧情，然后调用 save_arc_revision 提交修订后的弧大纲：目标必须吸收读者意见，并与已有剧情、已埋伏笔连贯；标题一般保留，除非意见要求更改。`,
 				onProcess: this.proc("director", true),
+				onStart: this.grabControl(),
 			});
 			const rev = collector.arcRevision;
 			if (rev && rev.title.trim() && rev.goal.trim()) {
@@ -631,6 +550,7 @@ export class Engine {
 				tools: [...sharedReadTools(this.store), sceneOutlineTool(this.store, dCollector)],
 				prompt: await assembleOutlineDerivationPrompt(this.store, this.state, round > 0 ? issues : undefined, carryIssues),
 				onProcess: this.proc("director", true),
+				onStart: this.grabControl(),
 			});
 			outline = dCollector.nextOutline?.outline.trim() ?? "";
 			if (!outline) {
@@ -728,7 +648,14 @@ export class Engine {
 		const loopIssues = detectRepetitionLoop(draft);
 		const reviewP = loopIssues.length > 0 ? Promise.resolve({ pass: false, issues: loopIssues } as const) : this.review(draft);
 		const reportP = this.directorReport(draft);
-		reportP.catch(() => {}); // 防未处理拒绝；真实结果在场景定稿后 await
+		// reportP 在下方 (4) 才 await；此 catch 仅覆盖「(4) 之前就已失败」的窗口，
+		// 防止没人接收的 rejection 被静默吞掉。正常路径下 reportSettled 已置位，
+		// 仍由 (4) 的 await 原样抛出，失败行为不变。
+		let reportSettled = false;
+		reportP.catch((err: unknown) => {
+			if (reportSettled) return;
+			this.emit({ type: "error", message: `导播场景报告失败：${err instanceof Error ? err.message : String(err)}` });
+		});
 		const verdict = await reviewP;
 		this.state.draftIssues = verdict.pass ? undefined : verdict.issues.map((i) => `- ${i.problem}（约束：${i.constraint}）`);
 		if (!verdict.pass) {
@@ -745,6 +672,7 @@ export class Engine {
 		this.emit({ type: "scene_done", scene: this.state.sceneIndex, title, text: draft });
 
 		// 4) 收取并行启动的场景报告（摘要/状态/伏笔/走向候选；落盘前过确定性门禁）
+		reportSettled = true;
 		const rawReport = await reportP;
 		let report: SceneReport | null = null;
 		if (rawReport) {
@@ -772,6 +700,7 @@ export class Engine {
 		} else {
 			this.presentChoices(report);
 			this.pipelineBusy = false; // 到达等待玩家的节点，解除互斥
+			this.clearControl();
 		}
 	}
 
@@ -845,6 +774,7 @@ export class Engine {
 			tools: [arcPlanTool(collector)], // 判断材料已全部内联，单次提交
 			prompt: await assembleArcPlanPrompt(this.store, this.state),
 			onProcess: this.proc("director", true),
+			onStart: this.grabControl(),
 		});
 		const plan = collector.arcPlan;
 		if (plan?.decision === "continue" && plan.title?.trim() && plan.goal?.trim()) {
@@ -870,6 +800,7 @@ export class Engine {
 	private async finishStory(): Promise<void> {
 		await this.setPhase("ended");
 		this.pipelineBusy = false;
+		this.clearControl();
 		this.emit({ type: "ended" });
 	}
 
@@ -899,6 +830,7 @@ export class Engine {
 				tools: [...sharedReadTools(this.store), memoryDistillTool(collector)],
 				prompt: await assembleMemoryDistillPrompt(this.store, this.state),
 				onProcess: this.proc("director", true),
+				onStart: this.grabControl(),
 			});
 			const distilledChars = collector.distilled?.characters ?? [];
 			for (const d of distilledChars) {
@@ -933,11 +865,9 @@ export class Engine {
 				prompt,
 			onDelta: (t) => this.emit({ type: "scene_delta", text: t }),
 			onProcess: this.proc("writer", false),
-			onStart: (control) => {
-				this.currentSteer = control.steer;
-			},
+			onStart: this.grabControl(),
 		});
-		this.currentSteer = null;
+		this.clearControl();
 		if (!result.text.trim()) {
 			throw new Error("Writer 返回了空稿");
 		}
@@ -961,7 +891,9 @@ export class Engine {
 			tools: [verdictTool(collector)], // 约束数据已全部内联，不开放检索工具（省工具环往返）
 			prompt: await assembleReviewerPrompt(this.store, this.state, draft, notes),
 			onProcess: this.proc("reviewer", true),
+			onStart: this.grabControl(),
 		});
+		this.clearControl();
 		const verdict = collector.verdict;
 		if (!verdict) {
 			this.emit({ type: "status", text: "校对未返回结论，按通过处理。" });
@@ -981,6 +913,7 @@ export class Engine {
 			tools: [sceneReportTool(collector)], // 快照/经济/伏笔已内联进 prompt，单次提交
 			prompt: await assembleDirectorReportPrompt(this.store, this.state, sceneText),
 			onProcess: this.proc("director", true),
+			onStart: this.grabControl(),
 		});
 		return collector.report ?? null;
 	}
@@ -1040,7 +973,7 @@ export class Engine {
 			this.emit({ type: "error", message: "引擎正在推进剧情（写作/校对/结算中），请稍后再重启。" });
 			return;
 		}
-		this.state = Engine.initialState();
+		this.state = initialGameState();
 		await this.commit();
 		this.emit({ type: "status", text: "已重置。输入故事灵感开始新故事。" });
 	}

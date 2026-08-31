@@ -7,7 +7,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Store } from "./facts/store.js";
 import type { GameState } from "./facts/types.js";
-import { detectRepetitionLoop } from "./engine/engine.js";
+import { detectRepetitionLoop } from "./engine/validate.js";
 import { assembleWriterPrompt, assembleReviewerPrompt } from "./engine/context.js";
 import { runAgent } from "./agents/agents.js";
 import { WRITER_SYSTEM, REVIEWER_SYSTEM } from "./agents/prompts.js";

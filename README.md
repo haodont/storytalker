@@ -25,6 +25,10 @@ npm run dev                 # 终端 TUI 玩
 npm run web                 # Web 版（手机浏览器可玩）
 ```
 
+**切换 LLM 服务商**：除改 `.env` 外，Web 版打开 ⚙ 设置 可直接选择「商汤 SenseNova / OpenAI 兼容 / 本地 llama.cpp」，填 Base URL、API Key、模型名后「测试连接」即可生效；配置按世界（工作区）持久化于 `设置.json`，覆盖 `.env` 默认值，无需重启服务。
+
+> ⚠️ **API Key 以明文保存在工作区的 `设置.json`**。工作区目录（`novel-workspace*`、`*-sessions`、`test-workspace*`）已在 `.gitignore` 中，但**请勿手动 `git add` 工作区目录**，改动工作区路径后请同步更新 `.gitignore`。
+
 **本地模型说明**（Qwen3.5-9B Q4_K_M + llama.cpp CUDA）：
 - `--jinja` + `enable_thinking:false` 关闭思考模式（思考会拖慢出字并污染正文）
 - `--dry-multiplier 0.8 --repeat-penalty 1.05` 抗复读采样；引擎另有确定性的复读检测兜底（草稿中 24 字块重复 ≥4 次自动打回重写）

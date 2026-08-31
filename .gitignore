@@ -11,12 +11,17 @@ dist/
 logs/
 
 # 运行时工作区（故事存档/章稿/记忆等玩家数据）
-novel-workspace/
-novel-workspace-sessions/
-try-workspace/
+# 通配：工作区名可由 NOVEL_WORKSPACE 指定，切勿只匹配默认名——
+# 工作区内含 设置.json（明文 API Key），漏配即泄露。
+novel-workspace*/
+novel-workspace-sessions*/
+*-sessions/
+try-workspace*/
+test-workspace*/
 
 # Prompt 调优台输出
 tune-out/
 
 # 本地工具配置
 .zcode/
+.workbuddy/

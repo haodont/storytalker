@@ -4,6 +4,31 @@
 // 供人阅读的内容以 Markdown 存储（总纲、场景正文、场景摘要）。文件即唯一事实源。
 // ---------------------------------------------------------------------------
 
+/** LLM 服务商：sensenova（商汤云）/ local（llama.cpp）/ openai（任意 OpenAI 兼容端点） */
+export type LlmProvider = "sensenova" | "local" | "openai";
+
+/** 单角色的模型/采样覆盖（缺省字段回退全局配置与代码默认） */
+export interface RoleOverride {
+	/** 覆盖模型名（空串 = 用全局 modelId） */
+	modelId?: string;
+	/** 覆盖采样温度（0-2；缺省 = 用 ROLE_MODELS 里的代码默认） */
+	temperature?: number;
+}
+
+/** LLM 接入配置（工作区级持久化；可在设置界面配置，引擎热加载） */
+export interface LlmSettings {
+	/** 服务商类型 */
+	provider: LlmProvider;
+	/** OpenAI 兼容 Base URL（local 为 llama-server 地址） */
+	baseUrl: string;
+	/** API Key（local 留空；sensenova/openai 缺失时回退到环境变量） */
+	apiKey: string;
+	/** 模型名（local/openai 为单一模型；sensenova 按角色自动分配，此为导播默认模型） */
+	modelId: string;
+	/** 按角色覆盖模型/温度（可选；旧存档无此字段视为全部回退） */
+	roles?: Partial<Record<"director" | "writer" | "reviewer", RoleOverride>>;
+}
+
 /** 运行时设置（工作区级持久化，设置界面读写；引擎热加载） */
 export interface RuntimeSettings {
 	/** 每弧场景数（2-50） */
@@ -12,6 +37,8 @@ export interface RuntimeSettings {
 	maxArcs: number;
 	/** 是否在设计阶段开放联网查证 */
 	webSearch: boolean;
+	/** LLM 服务商接入配置 */
+	llm: LlmSettings;
 }
 
 /** 世界实体：城市/势力/机构/资源等宏观对象（区别于个人角色卡）。state 随剧情演化，数字是代码管理的事实 */

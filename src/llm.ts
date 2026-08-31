@@ -10,24 +10,47 @@ import {
 } from "@earendil-works/pi-ai";
 import { stream as openaiCompletionsStream, streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import { LLM_PROVIDER, LOCAL_LLM, SENSENOVA, ROLE_MODELS, requireApiKey, type RoleName } from "./config.js";
+import type { LlmSettings } from "./facts/types.js";
+import { withResilience } from "./llm-resilience.js";
 
-function localModel(role: RoleName): Model<Api> {
+function localModel(
+	role: RoleName,
+	modelId: string = LOCAL_LLM.modelId,
+	baseUrl: string = LOCAL_LLM.baseUrl,
+	temperature: number = ROLE_MODELS[role].temperature,
+): Model<Api> {
 	return {
-		id: LOCAL_LLM.modelId,
-		name: `llama.cpp/${LOCAL_LLM.modelId}`,
+		id: modelId,
+		name: `llama.cpp/${modelId}`,
 		api: "openai-completions",
 		provider: LOCAL_LLM.providerId,
-		baseUrl: LOCAL_LLM.baseUrl,
+		baseUrl,
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: LOCAL_LLM.contextWindow,
 		maxTokens: LOCAL_LLM.maxTokens,
-		samplingParams: { temperature: ROLE_MODELS[role].temperature, top_p: 0.95 },
+		samplingParams: { temperature, top_p: 0.95 },
 	};
 }
 
-/** 构造一个 OpenAI 兼容模型的元数据（cost 仅用于用量统计展示，非计费依据） */
+/** 构造一个通用 OpenAI 兼容模型的元数据（cost 仅用于用量统计展示，非计费依据） */
+function openAiModel(id: string, baseUrl: string, contextWindow = 128000, maxTokens = 8192): Model<Api> {
+	return {
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "openai",
+		baseUrl,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow,
+		maxTokens,
+	};
+}
+
+/** 构造一个商汤 SenseNova 模型的元数据 */
 function sensenovaModel(id: string, name: string, contextWindow: number, maxTokens: number): Model<Api> {
 	return {
 		id,
@@ -43,32 +66,29 @@ function sensenovaModel(id: string, name: string, contextWindow: number, maxToke
 	};
 }
 
-const MODELS: Model<Api>[] = [
+const SENSENOVA_MODELS: Model<Api>[] = [
 	sensenovaModel("SenseChat-5", "SenseChat-5", 128000, 8192),
 	sensenovaModel("SenseNova-V6.5-Turbo", "SenseNova V6.5 Turbo", 128000, 8192),
 ];
 
-function buildModels(mock: boolean) {
-	const models = createModels();
-	if (mock) return models;
-	const provider = createProvider({
-		id: SENSENOVA.providerId,
-		name: "商汤 SenseNova",
-		baseUrl: SENSENOVA.baseUrl,
-		auth: {
-			apiKey: {
-				name: "SenseNova API Key",
-				resolve: async () =>
-					SENSENOVA.apiKey
-						? { auth: { apiKey: SENSENOVA.apiKey }, source: "SENSENOVA_API_KEY" }
-						: undefined,
-			},
-		},
-		models: MODELS,
-		api: { "openai-completions": { stream: openaiCompletionsStream, streamSimple: openaiCompletionsStreamSimple } },
-	});
-	models.setProvider(provider);
-	return models;
+/** 构建 LLM 所用的解析规格（来自环境变量或设置界面） */
+export interface LlmSpec {
+	provider: "sensenova" | "local" | "openai";
+	baseUrl: string;
+	apiKey: string;
+	modelId: string;
+	/** 按角色覆盖模型/温度（可选；缺省回退全局与 ROLE_MODELS） */
+	roles?: LlmSettings["roles"];
+}
+
+/** 由设置界面的 LLM 配置推导解析规格 */
+export function specFromSettings(llm: LlmSettings): LlmSpec {
+	return { provider: llm.provider, baseUrl: llm.baseUrl, apiKey: llm.apiKey, modelId: llm.modelId, roles: llm.roles };
+}
+
+/** 角色温度：设置覆盖优先，回退 ROLE_MODELS 代码默认 */
+function temperatureFor(s: LlmSpec, role: RoleName): number {
+	return s.roles?.[role]?.temperature ?? ROLE_MODELS[role].temperature;
 }
 
 export type StreamFn = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => ReturnType<typeof openaiCompletionsStreamSimple>;
@@ -78,29 +98,83 @@ export interface Llm {
 	streamFn: StreamFn;
 }
 
+/** 由环境变量推导规格（CLI 入口使用；设置界面走 specFromSettings） */
+function specFromEnv(): LlmSpec {
+	if (LLM_PROVIDER === "local") {
+		return { provider: "local", baseUrl: LOCAL_LLM.baseUrl, apiKey: "", modelId: LOCAL_LLM.modelId };
+	}
+	requireApiKey();
+	return { provider: "sensenova", baseUrl: SENSENOVA.baseUrl, apiKey: SENSENOVA.apiKey, modelId: ROLE_MODELS.director.modelId };
+}
+
+/** 按规格构建 OpenAI 兼容 provider（sensenova / openai 通用，local 走直连分支） */
+function buildOnlineProvider(spec: LlmSpec): { models: ReturnType<typeof createModels>; providerModels: Model<Api>[] } {
+	const providerModels: Model<Api>[] =
+		spec.provider === "sensenova"
+			? SENSENOVA_MODELS
+			: // openai 兼容：全局模型 + 角色覆盖模型（同 id 去重），保证角色覆盖可命中
+				[...new Set([spec.modelId, ...Object.values(spec.roles ?? {}).map((r) => r?.modelId ?? "").filter(Boolean)])].map(
+					(id) => openAiModel(id, spec.baseUrl),
+				);
+	const provider = createProvider({
+		id: spec.provider,
+		name: spec.provider === "sensenova" ? "商汤 SenseNova" : "OpenAI 兼容服务",
+		baseUrl: spec.baseUrl,
+		auth: {
+			apiKey: {
+				name: "API Key",
+				resolve: async () => {
+					const key = spec.apiKey || (spec.provider === "sensenova" ? SENSENOVA.apiKey : "");
+					return key ? { auth: { apiKey: key }, source: "settings" } : undefined;
+				},
+			},
+		},
+		models: providerModels,
+		api: { "openai-completions": { stream: openaiCompletionsStream, streamSimple: openaiCompletionsStreamSimple } },
+	});
+	const models = createModels();
+	models.setProvider(provider);
+	return { models, providerModels };
+}
+
+/** 角色模型查找（基于商汤预设模型表，mock 与兜底用） */
 function roleModel(role: RoleName): Model<Api> {
-	const spec = ROLE_MODELS[role];
-	const found = MODELS.find((m) => m.id === spec.modelId);
-	if (!found) throw new Error(`未配置的模型: ${spec.modelId}`);
+	const found = SENSENOVA_MODELS.find((m) => m.id === ROLE_MODELS[role].modelId) ?? SENSENOVA_MODELS[0];
+	if (!found) throw new Error(`未配置的模型: ${ROLE_MODELS[role].modelId}`);
 	return found;
 }
 
-/** 真实接入：按 LLM_PROVIDER 选择商汤云或本地 llama.cpp */
-export function createLlm(): Llm {
-	if (LLM_PROVIDER === "local") {
+/** 按规格构建接入：local 直连 llama-server；sensenova/openai 走注册 provider。
+ *  不传 spec 时由环境变量推导（CLI 入口）；Web 模式下每名由设置界面的 llm 配置驱动。 */
+export function createLlm(spec?: LlmSpec): Llm {
+	const s = spec ?? specFromEnv();
+	if (s.provider === "local") {
 		// llama-server 是单模型服务、不校验鉴权；绕过注册表直连 OpenAI 兼容端点，
 		// 按角色注入不同采样温度（samplingParams 随 model 对象携带）
 		return {
-			model: (role) => localModel(role),
+			model: (role) => localModel(role, s.modelId, s.baseUrl, temperatureFor(s, role)),
 			streamFn: (model, context, options) =>
 				openaiCompletionsStreamSimple(model as Model<"openai-completions">, context, { ...options, apiKey: "local" }),
 		};
 	}
-	requireApiKey();
-	const models = buildModels(false);
+	const { models, providerModels } = buildOnlineProvider(s);
+	// 角色模型：设置覆盖优先；sensenova 回退按角色预设表，openai 回退全局模型
+	const roleModelId = (role: RoleName): string => {
+		const override = s.roles?.[role]?.modelId;
+		if (override) return override;
+		return s.provider === "sensenova" ? ROLE_MODELS[role].modelId : s.modelId;
+	};
+	// 在线模型叠加两级超时 + 指数退避重试；本地分支（streamFn 直连）不走此逻辑。
+	const resilientStreamFn = withResilience((model, context, options) => models.streamSimple(model, context, options));
 	return {
-		model: roleModel,
-		streamFn: (model, context, options) => models.streamSimple(model, context, options),
+		model: (role) => {
+			const id = roleModelId(role);
+			const found = providerModels.find((m) => m.id === id);
+			if (!found) throw new Error(`未配置的模型: ${id}`);
+			// 温度随 model 对象下发（pi 按 Model.samplingParams 合并请求）；openai 兼容服务首次获得按角色温度
+			return { ...found, samplingParams: { temperature: temperatureFor(s, role), top_p: 0.95 } };
+		},
+		streamFn: resilientStreamFn,
 	};
 }
 

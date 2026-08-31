@@ -4,9 +4,11 @@ import { cp } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Engine, type EngineEvent } from "../engine/engine.js";
-import type { GameState } from "../facts/types.js";
+import type { GameState, RuntimeSettings, LlmSettings } from "../facts/types.js";
 import { Store } from "../facts/store.js";
-import type { Llm } from "../llm.js";
+import { exportHtml, exportMarkdown } from "../export/markdown.js";
+import { createLlm, createMockLlm, specFromSettings } from "../llm.js";
+import { normalizeLlm } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Web 服务：零依赖（node:http）。单玩家个人服务器。
@@ -29,6 +31,24 @@ const FILE_WHITELIST = ["大纲/总纲.md", "大纲/弧-01.md", "设定/世界�
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
 /**
+ * 从 pi-ai 的 AssistantMessage 中取出可读文本。
+ * 流错误事件结构为 { type:"error"; reason:"aborted"|"error"; error: AssistantMessage }——
+ * error 是消息对象而非字符串，直接 JSON.stringify 会把整条消息结构倾倒给用户。
+ */
+function messageText(msg: unknown): string {
+	// 流错误的可读文本在 errorMessage（pi-ai AssistantMessage 约定），content 兜底
+	const em = (msg as { errorMessage?: unknown } | null | undefined)?.errorMessage;
+	if (typeof em === "string" && em.trim()) return em.trim();
+	const content = (msg as { content?: { type?: string; text?: string }[] } | null | undefined)?.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((c): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
+		.map((c) => c.text)
+		.join("")
+		.trim();
+}
+
+/**
  * 会话管理：main 会话用基础工作区，其余会话在 <工作区>-sessions/<id>（与主工作区平级，
  * 放内部会让 fork 变成"复制到自己内部"）。分叉 = 复制整个工作区目录（文件即事实源，
  * 目录即平行宇宙）+ 可选读入某存档为当前进度。
@@ -41,7 +61,7 @@ export class SessionManager {
 	constructor(
 		private readonly baseRoot: string,
 		private readonly token: string,
-		private readonly llm: Llm,
+		readonly mock: boolean,
 	) {
 		const abs = path.resolve(baseRoot);
 		this.sessionsRoot = path.join(path.dirname(abs), path.basename(abs) + "-sessions");
@@ -84,6 +104,7 @@ export class SessionManager {
 	/** 某个世界的存档树（直接读盘，不 boot） */
 	async savesFor(id: string): Promise<{ name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[]> {
 		const store = new Store(this.sessionRoot(id));
+		// 降级是有意为之：存档目录可能尚未创建（全新世界），此时视为无存档，非吞错
 		const files = await store.listDir("存档").catch(() => [] as string[]);
 		const out: { name: string; title: string; phase: string; sceneIndex: number; updatedAt: string; parent: string | null }[] = [];
 		for (const f of files.filter((x) => x.endsWith(".json") && x !== "current.json")) {
@@ -97,7 +118,11 @@ export class SessionManager {
 	async get(id: string): Promise<WebHub> {
 		const existing = this.booting.get(id);
 		if (existing) return existing;
-		const hub = new WebHub(new Engine(new Store(this.sessionRoot(id)), this.llm, () => {}), this.token);
+		// 按本会话持久化的 LLM 配置构建接入（mock 模式恒用 mock，忽略配置）
+		const store = new Store(this.sessionRoot(id));
+		const settings = await store.loadSettings();
+		const llm = this.mock ? createMockLlm() : createLlm(specFromSettings(settings.llm));
+		const hub = new WebHub(new Engine(store, llm, () => {}), this.token);
 		this.sessions.set(id, hub);
 		const booting = hub.boot().then(() => hub);
 		this.booting.set(id, booting);
@@ -253,6 +278,17 @@ export class WebHub {
 		});
 	}
 
+	/**
+	 * 后台执行引擎动作并兜底异常：转成一个 error 事件（经 engine.emit 广播 + 落盘）。
+	 * 禁止再写 `.catch(() => {})`——那会让失败表现为「界面卡住不动」且查无痕迹。
+	 */
+	private run(p: Promise<void>, context: string): void {
+		void p.catch((err: unknown) => {
+			const message = err instanceof Error ? err.message : String(err);
+			this.engine.emit({ type: "error", message: `${context}失败：${message}` });
+		});
+	}
+
 	async handleInput(body: { text?: string }): Promise<{ ok: boolean; message?: string }> {
 		const text = (body.text ?? "").trim();
 		if (!text) return { ok: false, message: "输入为空" };
@@ -261,26 +297,26 @@ export class WebHub {
 			// 「构建：…」= 结束酝酿直接开工；其余输入都是灵感对话
 			const buildMatch = text.match(/^构建[:：]?\s*(.*)$/s);
 			if (buildMatch) {
-				void this.engine.buildFromIdea(buildMatch[1]).catch(() => {});
+				this.run(this.engine.buildFromIdea(buildMatch[1]), "故事构建");
 			} else {
-				void this.engine.chatIdea(text).catch(() => {});
+				this.run(this.engine.chatIdea(text), "灵感对话");
 			}
 			return { ok: true };
 		}
 		if (s.phase === "confirm_bible") {
-			void this.engine.confirmBible(text).catch(() => {});
+			this.run(this.engine.confirmBible(text), "设定确认");
 			return { ok: true };
 		}
 		if (s.phase === "playing") {
 			// 「大纲：…」= 玩家意见 → 导播修订弧大纲（优先于选择/插话路由）
 			const outlineMatch = text.match(/^大纲[:：]\s*(.+)$/s);
 			if (outlineMatch && outlineMatch[1]) {
-				void this.engine.reviseArc(outlineMatch[1].trim()).catch(() => {});
+				this.run(this.engine.reviseArc(outlineMatch[1].trim()), "大纲修订");
 				return { ok: true };
 			}
 		}
 		if (s.phase === "playing" && s.pendingReport) {
-			void this.engine.resolveChoice(text).catch(() => {});
+			this.run(this.engine.resolveChoice(text), "剧情推进");
 			return { ok: true };
 		}
 		this.engine.steer(text);
@@ -409,16 +445,59 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 	}
 	if (req.method === "GET" && pathname === "/api/settings") {
 		// token 一并返回：设置界面展示局域网访问地址用（已过鉴权）
-		return json(res, 200, { ok: true, settings: hub.engine.settings, token: sessions.tokenFor() });
+		// API Key 不回传明文：以 llmHasKey 告知前端是否已保存，前端留空即代表保留
+		const settings = hub.engine.settings;
+		return json(res, 200, {
+			ok: true,
+			settings: { ...settings, llm: { ...settings.llm, apiKey: "" } },
+			llmHasKey: !!settings.llm.apiKey,
+			token: sessions.tokenFor(),
+		});
 	}
 	if (req.method === "POST" && pathname === "/api/settings") {
-		const body = await readJson(req);
-		const message = await hub.engine.updateSettings(body as { scenesPerArc?: number; maxArcs?: number; webSearch?: boolean });
+		const body = (await readJson(req)) as Partial<RuntimeSettings>;
+		// API Key 留空且已有密钥 → 保留原密钥（避免明文回传被清空）
+		if (body.llm && body.llm.apiKey === "" && hub.engine.settings.llm.apiKey) {
+			body.llm = { ...body.llm, apiKey: hub.engine.settings.llm.apiKey };
+		}
+		const message = await hub.engine.updateSettings(body);
 		if (message) return json(res, 200, { ok: false, message });
 		return json(res, 200, { ok: true, settings: hub.engine.settings });
 	}
+	if (req.method === "POST" && pathname === "/api/llm-test") {
+		// 用前端提交的（或当前）配置做一次最小连通性测试，不落盘
+		if (sessions.mock) return json(res, 200, { ok: true, sample: "(mock) 连接正常（mock 模式不调用真实服务）" });
+		const body = (await readJson(req)) as { llm?: Partial<LlmSettings> };
+		const llm = createLlm(specFromSettings(normalizeLlm(body.llm)));
+		try {
+			const model = llm.model("writer");
+			const ctx = { systemPrompt: "", messages: [{ role: "user", content: "请只回复 pong" }] } as unknown as Parameters<typeof llm.streamFn>[1];
+			const stream = llm.streamFn(model, ctx, {});
+			let sample = "";
+			const t0 = Date.now();
+			for await (const ev of stream as AsyncIterable<{ type: string; delta?: string; error?: unknown; reason?: unknown }>) {
+				if (ev.type === "error") {
+					const reason = typeof ev.reason === "string" ? ev.reason : "";
+					throw new Error(messageText(ev.error) || (reason === "aborted" ? "请求被中断" : "未知错误"));
+				}
+				if (ev.type === "text_delta") sample += ev.delta ?? "";
+				if (sample.length >= 24) break;
+				if (Date.now() - t0 > 15000) break;
+			}
+			if (!sample.trim()) return json(res, 200, { ok: false, message: "已连通但未返回文本（检查模型名/参数）" });
+			return json(res, 200, { ok: true, sample: sample.slice(0, 60) });
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			return json(res, 200, { ok: false, message: "连接失败：" + msg });
+		}
+	}
 	if (req.method === "POST" && pathname === "/api/input") {
 		return json(res, 200, await hub.handleInput(await readJson(req)));
+	}
+	if (req.method === "POST" && pathname === "/api/abort") {
+		// 中断当前生成：引擎以 aborted 收尾并回到稳定态，前端按钮触发
+		const ok = hub.engine.abortGeneration();
+		return json(res, 200, { ok: true, aborted: ok });
 	}
 	if (req.method === "POST" && pathname === "/api/command") {
 		const body = await readJson(req);
@@ -432,6 +511,24 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 		const rel = url.searchParams.get("path") ?? "";
 		if (!FILE_WHITELIST.includes(rel)) return json(res, 403, { ok: false, message: "path 不在白名单" });
 		return json(res, 200, { ok: true, content: await hub.engine.store.readText(rel) });
+	}
+	if (req.method === "GET" && pathname === "/api/export") {
+		// 导出整本（只读）：md = Markdown 文本；html = 单文件离线阅读页
+		const format = url.searchParams.get("format") ?? "md";
+		const scenes = await hub.engine.store.readAllScenes();
+		if (scenes.length === 0) return json(res, 200, { ok: false, message: "还没有任何已写场景，无可导出" });
+		const title = hub.engine.gameState.title || "未命名";
+		if (format === "html") {
+			const html = exportHtml(title, scenes);
+			res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(title)}.html` });
+			res.end(html);
+			return;
+		}
+		const md = exportMarkdown(title, scenes);
+		if (md === null) return json(res, 200, { ok: false, message: "导出失败" });
+		res.writeHead(200, { "content-type": "text/markdown; charset=utf-8", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(title)}.md` });
+		res.end(md);
+		return;
 	}
 	return json(res, 404, { ok: false, message: "not found" });
 }

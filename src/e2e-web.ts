@@ -2,19 +2,18 @@
 //   npm run e2e:web
 
 import { promises as fs } from "node:fs";
-import { createMockLlm } from "./llm.js";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { SessionManager, startWebServer, type WebHub } from "./web/server.js";
 
-const WORKSPACE = "test-workspace-web";
+// 每次运行用独立临时工作区：上轮残留不会污染本轮，清理失败也不会阻断本轮
+const WORKSPACE = await fs.mkdtemp(path.join(tmpdir(), "storytalker-e2e-"));
 const PORT = 34771;
 const TOKEN = "test-token";
 const base = `http://127.0.0.1:${PORT}`;
 
 async function main(): Promise<void> {
-	await fs.rm(WORKSPACE, { recursive: true, force: true });
-	await fs.rm(WORKSPACE + "-sessions", { recursive: true, force: true });
-
-	const sessions = new SessionManager(WORKSPACE, TOKEN, createMockLlm());
+	const sessions = new SessionManager(WORKSPACE, TOKEN, true);
 	const hub = await sessions.get("main");
 	await startWebServer(sessions, PORT);
 
@@ -113,7 +112,12 @@ async function main(): Promise<void> {
 	}
 	console.log(`\n结果：${failed === 0 ? "全部通过 ✓" : `${failed} 项失败 ✗`}`);
 	await fs.rm(WORKSPACE, { recursive: true, force: true });
-	await fs.rm(WORKSPACE + "-sessions", { recursive: true, force: true });
+	try {
+		await fs.rm(WORKSPACE, { recursive: true, force: true });
+		await fs.rm(WORKSPACE + "-sessions", { recursive: true, force: true });
+	} catch {
+		// 清理失败（如安全策略拦截批量删除）不影响结果判定：下次运行会用新的临时目录
+	}
 	process.exit(failed === 0 ? 0 : 1);
 }
 

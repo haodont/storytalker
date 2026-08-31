@@ -87,16 +87,30 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
 
 	// 取最后一条 assistant 消息的文本（mock/工具调用场景下 lastText 可能为空）
 	const messages = agent.state.messages;
+	let finalStop: string | undefined;
+	let finalErr: string | undefined;
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i] as { role: string; content: { type: string; text?: string }[] };
+		const m = messages[i] as { role: string; content: { type: string; text?: string }[]; stopReason?: string; errorMessage?: string };
 		if (m.role === "assistant") {
 			const t = m.content
 				.filter((b) => b.type === "text")
 				.map((b) => b.text ?? "")
 				.join("");
 			if (t.trim()) lastText = t;
+			finalStop = m.stopReason;
+			finalErr = m.errorMessage;
 			break;
 		}
+	}
+
+	// 流式调用被超时/重试耗尽/不可用中止时，底层只回传 stopReason="error" 的最终消息，
+	// Agent 不会抛错。此处主动抛出明确错误，使引擎的 void(p) 能捕获并 emit error 事件，
+	// 避免整章在“无响应”下静默产出残缺内容。
+	if (finalStop === "aborted") {
+		throw new Error(`LLM 调用被中止：${finalErr ?? "请求在流式过程中被取消"}`);
+	}
+	if (finalStop === "error") {
+		throw new Error(`LLM 调用失败：${finalErr ?? "未知错误（流式返回 error 终止）"}`);
 	}
 
 	return { text: lastText, tokens: usage };

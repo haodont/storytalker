@@ -2,13 +2,16 @@
 //   npm run e2e
 
 import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store } from "./facts/store.js";
 import { Engine, type EngineEvent } from "./engine/engine.js";
 import { createLlm, createMockLlm, mockWriterPrompts } from "./llm.js";
 
-const WORKSPACE = "test-workspace";
-const WORKSPACE_MANUAL = "test-workspace-manual";
+// 每轮用独立临时根目录：上轮残留不会污染本轮，清理失败也不会阻断本轮
+const TMP_ROOT = await fs.mkdtemp(path.join(tmpdir(), "storytalker-e2e-mock-"));
+const WORKSPACE = path.join(TMP_ROOT, "auto");
+const WORKSPACE_MANUAL = path.join(TMP_ROOT, "manual");
 
 async function testManualMode(): Promise<[string, boolean][]> {
 	const checks: [string, boolean][] = [];
@@ -196,7 +199,7 @@ async function main(): Promise<void> {
 
 	// 断点恢复：模拟崩溃后从 playing 中期恢复（在分叉出的工作区上验证）
 	// 恢复测试（同时验证工作区参数化/分叉）：复制工作区到分叉目录，构造 playing 中断态再 boot
-	const FORK = "test-workspace-fork";
+	const FORK = path.join(TMP_ROOT, "fork");
 	await fs.rm(FORK, { recursive: true, force: true });
 	await fs.cp(path.resolve(WORKSPACE), path.resolve(FORK), { recursive: true });
 	const forkStore = new Store(FORK);
@@ -243,10 +246,9 @@ async function main(): Promise<void> {
 
 	console.log(`\n结果：${failed === 0 ? "全部通过 ✓" : `${failed} 项失败 ✗`}`);
 	// 清理：等待异步操作结束后删除（Windows 下文件句柄未释放会 ENOTEMPTY）
+	// 清理失败（如安全策略拦截批量删除）不影响结果判定：下轮会用新的临时根目录
 	await new Promise((r) => setTimeout(r, 200));
-	await fs.rm(path.resolve(WORKSPACE), { recursive: true, force: true }).catch(() => {});
-	await fs.rm(path.resolve(FORK), { recursive: true, force: true }).catch(() => {});
-	await fs.rm(path.resolve(WORKSPACE_MANUAL), { recursive: true, force: true }).catch(() => {});
+	await fs.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 	process.exit(failed === 0 ? 0 : 1);
 }
 

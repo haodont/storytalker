@@ -137,7 +137,14 @@ function setBusy(b) {
   if (state.busy === b) return;
   state.busy = b;
   renderStatus();
+  // 生成中显示「■ 停止」按钮；空闲隐藏
+  $("stopBtn").style.display = b ? "" : "none";
 }
+
+$("stopBtn").onclick = async () => {
+  const r = await api("/api/abort", {}); // body 非空 → POST
+  if (r && r.ok && !r.aborted) toastsEl.show("当前没有正在进行的生成任务", "note");
+};
 
 function hintFor() {
   if (state.phase === "empty") return "随便聊聊你的灵感（题材/主角/想要的基调），聊透了再构建；也可输入「构建：一句话」直接开工";
@@ -666,6 +673,77 @@ async function loadSaveTree(worldId) {
 
 // ---------- 设置 ----------
 const settingsDlg = $("settingsDlg");
+const PROVIDER_DEFAULTS = {
+  sensenova: { baseUrl: "https://api.sensenova.cn/compatible-mode/v2", modelId: "SenseChat-5", needsKey: true,
+    modelHint: "按角色自动分配：导播/执笔 SenseChat-5，校对 SenseNova-V6.5-Turbo" },
+  openai: { baseUrl: "https://api.openai.com/v1", modelId: "gpt-4o-mini", needsKey: true,
+    modelHint: "填入你的 OpenAI 兼容模型名（DeepSeek / 通义千问 / Kimi 等）" },
+  local: { baseUrl: "http://127.0.0.1:8137/v1", modelId: "qwen3.5-9b", needsKey: false,
+    modelHint: "本地 llama.cpp llama-server 地址与模型名" },
+};
+let curLlmHasKey = false;
+// 角色默认温度（须与 src/config.ts ROLE_MODELS 同步；滑块缺省位置）
+const ROLE_TEMP_DEFAULTS = { director: 0.7, writer: 0.9, reviewer: 0.2 };
+const ROLES = ["director", "writer", "reviewer"];
+const ROLE_NAMES = { director: "setRoleDirector", writer: "setRoleWriter", reviewer: "setRoleReviewer" };
+
+/** 读滑块当前温度 */
+function roleTemp(role) {
+  return Number($(ROLE_NAMES[role] + "Temp").value);
+}
+
+/** 填充角色覆盖区：llm.roles 存在用其值，否则落默认温度、清空模型覆盖 */
+function fillRoleOverrides(llm) {
+  for (const r of ROLES) {
+    const o = llm.roles?.[r] ?? {};
+    $(ROLE_NAMES[r] + "Model").value = o.modelId ?? "";
+    const t = o.temperature ?? ROLE_TEMP_DEFAULTS[r];
+    $(ROLE_NAMES[r] + "Temp").value = t;
+    $(ROLE_NAMES[r] + "TempVal").textContent = "（当前 " + t + "，默认 " + ROLE_TEMP_DEFAULTS[r] + "）";
+  }
+}
+
+/** 从界面收集角色覆盖：仅当与默认不同才写入（缺省语义 = 回退全局） */
+function collectRoleOverrides() {
+  const roles = {};
+  for (const r of ROLES) {
+    const modelId = $(ROLE_NAMES[r] + "Model").value.trim();
+    const temperature = roleTemp(r);
+    const o = {};
+    if (modelId) o.modelId = modelId;
+    if (temperature !== ROLE_TEMP_DEFAULTS[r]) o.temperature = temperature;
+    if (Object.keys(o).length > 0) roles[r] = o;
+  }
+  return Object.keys(roles).length > 0 ? roles : undefined;
+}
+
+for (const r of ROLES) {
+  $(ROLE_NAMES[r] + "Temp").oninput = (e) => {
+    $(ROLE_NAMES[r] + "TempVal").textContent = "（当前 " + e.target.value + "，默认 " + ROLE_TEMP_DEFAULTS[r] + "）";
+  };
+}
+$("setRolesReset").onclick = () => fillRoleOverrides({});
+
+/** 按服务商切换预填默认值 / 禁用态 / 提示；overwrite=true 时覆盖 BaseURL 与模型名 */
+function applyProviderPreset(provider, overwrite) {
+  const d = PROVIDER_DEFAULTS[provider];
+  if (overwrite) {
+    $("setBaseUrl").value = d.baseUrl;
+    $("setModelId").value = d.modelId;
+    // 切换服务商清空角色模型覆盖，避免残留旧服务商的模型名（温度保留，与服务商无关）
+    for (const r of ROLES) $(ROLE_NAMES[r] + "Model").value = "";
+  }
+  $("setBaseUrl").disabled = provider === "sensenova";
+  $("setApiKey").disabled = !d.needsKey;
+  $("setModelId").disabled = provider === "sensenova";
+  $("setApiKeyHint").textContent = curLlmHasKey
+    ? "已保存密钥，留空则保留"
+    : (d.needsKey ? "必填（可留空回退到环境变量）" : "本地模型无需密钥");
+  $("setModelHint").textContent = d.modelHint;
+}
+
+$("setProvider").onchange = () => applyProviderPreset($("setProvider").value, true);
+
 $("settingsBtn").onclick = async () => {
   const s = await api("/api/settings");
   if (!s || s.ok === false) { toastsEl.show((s && s.message) || "读取设置失败", "err"); return; }
@@ -673,6 +751,14 @@ $("settingsBtn").onclick = async () => {
   $("setScenes").value = s.settings.scenesPerArc;
   $("setArcs").value = s.settings.maxArcs;
   $("setWeb").checked = !!s.settings.webSearch;
+  const llm = s.settings.llm || { provider: "sensenova", baseUrl: "", apiKey: "", modelId: "" };
+  curLlmHasKey = !!s.llmHasKey;
+  $("setProvider").value = llm.provider;
+  applyProviderPreset(llm.provider, false);
+  $("setBaseUrl").value = llm.baseUrl;
+  $("setModelId").value = llm.modelId;
+  $("setApiKey").value = ""; // 不回显明文
+  fillRoleOverrides(llm);
   $("setLan").textContent = location.origin + "/?token=" + s.token;
   $("setToken").textContent = s.token;
   settingsDlg.showModal();
@@ -682,15 +768,63 @@ $("setSave").onclick = async () => {
   // 模式：与当前不同才发命令
   const wantMode = $("setMode").value;
   if (wantMode !== lastMode) await command("mode:" + wantMode);
+  const llm = {
+    provider: $("setProvider").value,
+    baseUrl: $("setBaseUrl").value.trim(),
+    apiKey: $("setApiKey").value,
+    modelId: $("setModelId").value.trim(),
+  };
+  const roles = collectRoleOverrides();
+  if (roles) llm.roles = roles;
   const r = await api("/api/settings", {
     scenesPerArc: Number($("setScenes").value),
     maxArcs: Number($("setArcs").value),
     webSearch: $("setWeb").checked,
+    llm,
   });
   if (r && r.ok === false) { toastsEl.show(r.message || "保存失败", "err"); return; }
-  toastsEl.show("设置已保存", "ok");
+  toastsEl.show("设置已保存（下一场景起生效）", "ok");
   settingsDlg.close();
 };
+$("setTest").onclick = async () => {
+  const llm = {
+    provider: $("setProvider").value,
+    baseUrl: $("setBaseUrl").value.trim(),
+    apiKey: $("setApiKey").value,
+    modelId: $("setModelId").value.trim(),
+  };
+  const btn = $("setTest");
+  btn.disabled = true; const old = btn.textContent; btn.textContent = "测试中…";
+  const r = await api("/api/llm-test", { llm });
+  btn.disabled = false; btn.textContent = old;
+  if (r && r.ok) toastsEl.show("连接成功：" + (r.sample || ""), "ok");
+  else toastsEl.show((r && r.message) || "连接失败", "err");
+};
+
+// 导出：整本下载（只读，不落盘）——fetch 校验失败原因后走 blob 下载
+async function downloadExport(format) {
+  const link = "/api/export?format=" + format + "&session=" + encodeURIComponent(SESSION) + "&token=" + encodeURIComponent(TOKEN);
+  const r = await fetch(link, { headers: { authorization: "Bearer " + TOKEN } });
+  const ct = r.headers.get("content-type") || "";
+  if (!r.ok || ct.includes("application/json")) {
+    let msg = "导出失败";
+    try { const j = await r.json(); if (j && j.message) msg = j.message; } catch (e) {}
+    toastsEl.show(msg, "err");
+    return;
+  }
+  const blob = await r.blob();
+  const cd = r.headers.get("content-disposition") || "";
+  const name = (cd.match(/filename\*=UTF-8''([^;]+)/) || [null, "story." + format])[1] || "story." + format;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = decodeURIComponent(name);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+$("exportMd").onclick = () => downloadExport("md");
+$("exportHtml").onclick = () => downloadExport("html");
 
 async function showFile(rel) {
   const r = await api("/api/file?path=" + encodeURIComponent(rel) + "&token=" + encodeURIComponent(TOKEN));

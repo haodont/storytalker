@@ -350,6 +350,16 @@ export function webSearchTool(): AgentTool {
 
 interface WebSearchResult { title: string; snippet: string; url: string }
 
+/** 同域名限频（≥1s 间隔，降反爬） */
+const lastRequestMs = new Map<string, number>();
+
+function rateLimitHost(host: string): Promise<void> {
+	const last = lastRequestMs.get(host) ?? 0;
+	const wait = Math.max(0, 1000 - (Date.now() - last));
+	lastRequestMs.set(host, Date.now());
+	return new Promise((r) => setTimeout(r, wait));
+}
+
 const stripTags = (s: string) =>
 	s
 		.replace(/<[^>]*>/g, "")
@@ -363,30 +373,45 @@ const stripTags = (s: string) =>
 		.trim();
 
 async function webSearch(query: string): Promise<WebSearchResult[] | null> {
-	const bing = await trySearch(
-		`https://cn.bing.com/search?q=${encodeURIComponent(query)}&mkt=zh-CN&count=8`,
-		/<li class="b_algo"[\s\S]*?<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>([\s\S]*?)<\/li>/g,
-		/<p[^>]*>([\s\S]*?)<\/p>/,
-	);
+	// 双源互备：Bing 优先，DDG 兜底；主源失败/超时自动切换，总预算由各自 9s 超时封顶
+	const [bing, ddg] = await Promise.all([
+		trySearch(
+			`https://cn.bing.com/search?q=${encodeURIComponent(query)}&mkt=zh-CN&count=8`,
+			/<li class="b_algo"[\s\S]*?<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>([\s\S]*?)<\/li>/g,
+			/<p[^>]*>([\s\S]*?)<\/p>/,
+		),
+		trySearch(
+			`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+			/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]*class="result__a"|<\/div>\s*<\/div>\s*<\/div>|$)/g,
+			/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/,
+		),
+	]);
+	// 失败可见性：任一源失败都留痕（console），双源全败返回 null（工具会提示 LLM 保守行文）
 	if (bing && bing.length > 0) return bing;
-	const ddg = await trySearch(
-		`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-		/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]*class="result__a"|<\/div>\s*<\/div>\s*<\/div>|$)/g,
-		/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/,
-	);
-	return ddg;
+	if (ddg && ddg.length > 0) return ddg;
+	if (bing === null && ddg === null) {
+		console.error("[webSearch] 双源均失败（Bing/DDG），query=", query.slice(0, 60));
+	} else if ((bing?.length ?? 0) === 0 && (ddg?.length ?? 0) === 0) {
+		console.warn("[webSearch] 双源连通但解析结果为空（页面结构可能已变），query=", query.slice(0, 60));
+	}
+	return null;
 }
 
 async function trySearch(url: string, itemRe: RegExp, snippetRe: RegExp): Promise<WebSearchResult[] | null> {
+	const host = new URL(url).host;
+	await rateLimitHost(host); // 同域名限频，降反爬
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), 9000);
 	try {
-		const ctrl = new AbortController();
-		const timer = setTimeout(() => ctrl.abort(), 9000);
 		const res = await fetch(url, {
 			headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36", "accept-language": "zh-CN,zh;q=0.9" },
 			signal: ctrl.signal,
 		});
 		clearTimeout(timer);
-		if (!res.ok) return null;
+		if (!res.ok) {
+			console.error(`[webSearch] ${host} HTTP ${res.status}`);
+			return null;
+		}
 		const html = await res.text();
 		const out: WebSearchResult[] = [];
 		for (const m of html.matchAll(itemRe)) {
@@ -399,7 +424,10 @@ async function trySearch(url: string, itemRe: RegExp, snippetRe: RegExp): Promis
 			if (out.length >= 6) break;
 		}
 		return out;
-	} catch {
+	} catch (err) {
+		clearTimeout(timer);
+		const aborted = err instanceof Error && err.name === "AbortError";
+		console.error(`[webSearch] ${host} ${aborted ? "超时(9s)" : `异常 ${err instanceof Error ? err.message : String(err)}`}`);
 		return null;
 	}
 }

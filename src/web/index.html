@@ -274,10 +274,15 @@
   #settingsDlg h3 { margin: 0 0 18px; font-size: 17px; color: var(--accent, #d9a45b); letter-spacing: 4px; }
   #settingsDlg label { display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; color: var(--dim, #7a7770); margin-bottom: 14px; }
   #settingsDlg label.chk { flex-direction: row; align-items: center; gap: 8px; font-size: 14px; color: var(--ink, #d8d5cf); }
-  #settingsDlg select, #settingsDlg input[type="number"] {
+  #settingsDlg select, #settingsDlg input[type="number"], #settingsDlg input[type="text"], #settingsDlg input[type="password"] {
     background: var(--bg, #141416); border: 1px solid var(--line, #2a2a30); color: var(--ink, #d8d5cf);
-    border-radius: 8px; padding: 8px 11px; font-size: 14.5px; font-family: inherit; outline: none;
+    border-radius: 8px; padding: 8px 11px; font-size: 14.5px; font-family: inherit; outline: none; width: 100%; box-sizing: border-box;
   }
+  #settingsDlg input:disabled { opacity: .5; cursor: not-allowed; }
+  #settingsDlg fieldset.setgrp { border: 1px solid var(--line, #2a2a30); border-radius: 10px; padding: 4px 14px 14px; margin: 0 0 16px; }
+  #settingsDlg fieldset.setgrp legend { font-size: 12px; letter-spacing: 2px; color: var(--accent, #d9a45b); padding: 0 6px; }
+  #settingsDlg .setgrp .hint { font-size: 11.5px; color: var(--dim, #7a7770); margin-top: 4px; line-height: 1.5; }
+  #settingsDlg .setgrp .row { justify-content: flex-start; margin-top: 4px; }
   #settingsDlg input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent, #d9a45b); }
   #settingsDlg .setinfo { font-size: 12.5px; line-height: 1.8; color: var(--dim, #7a7770); margin: 6px 0 16px; word-break: break-all; }
   #settingsDlg .setinfo code { color: var(--accent, #d9a45b); font-size: 12px; }
@@ -319,6 +324,7 @@
   <div class="brand">
     <div id="title">互动小说</div>
     <x-status id="status"></x-status>
+    <button id="stopBtn" class="sm danger" title="中断当前生成" style="display:none">■ 停止</button>
   </div>
   <div class="hgroups">
     <div class="hgroup">
@@ -388,6 +394,55 @@
     <input id="setArcs" type="number" min="1" max="20" step="1">
   </label>
   <label class="chk"><input id="setWeb" type="checkbox"> 设计开局时允许联网查证史实</label>
+  <fieldset class="setgrp">
+    <legend>LLM 服务商</legend>
+    <label>服务商
+      <select id="setProvider">
+        <option value="sensenova">商汤 SenseNova（云端）</option>
+        <option value="openai">OpenAI 兼容（DeepSeek / 通义 / 月之暗面…）</option>
+        <option value="local">本地 llama.cpp</option>
+      </select>
+    </label>
+    <label>Base URL
+      <input id="setBaseUrl" type="text" spellcheck="false" autocomplete="off">
+    </label>
+    <label>API Key
+      <input id="setApiKey" type="password" spellcheck="false" autocomplete="off">
+      <span class="hint" id="setApiKeyHint"></span>
+    </label>
+    <label>模型名
+      <input id="setModelId" type="text" spellcheck="false" autocomplete="off">
+      <span class="hint" id="setModelHint"></span>
+    </label>
+    <div class="row">
+      <button id="setTest" type="button">测试连接</button>
+      <span class="hsep"></span>
+      <button id="exportMd" type="button" title="导出整本 Markdown">导出 MD</button>
+      <button id="exportHtml" type="button" title="导出单文件 HTML（离线阅读）">导出 HTML</button>
+    </div>
+    <details id="setRolesBox">
+      <summary>按角色覆盖模型 / 温度（高级）</summary>
+      <label>导播模型名
+        <input id="setRoleDirectorModel" type="text" spellcheck="false" autocomplete="off" placeholder="留空 = 用上方全局模型">
+      </label>
+      <label>导播温度 <span class="hint" id="setRoleDirectorTempVal"></span>
+        <input id="setRoleDirectorTemp" type="range" min="0" max="1.5" step="0.05">
+      </label>
+      <label>执笔模型名
+        <input id="setRoleWriterModel" type="text" spellcheck="false" autocomplete="off" placeholder="留空 = 用上方全局模型">
+      </label>
+      <label>执笔温度 <span class="hint" id="setRoleWriterTempVal"></span>
+        <input id="setRoleWriterTemp" type="range" min="0" max="1.5" step="0.05">
+      </label>
+      <label>校对模型名
+        <input id="setRoleReviewerModel" type="text" spellcheck="false" autocomplete="off" placeholder="留空 = 用上方全局模型">
+      </label>
+      <label>校对温度 <span class="hint" id="setRoleReviewerTempVal"></span>
+        <input id="setRoleReviewerTemp" type="range" min="0" max="1.5" step="0.05">
+      </label>
+      <button id="setRolesReset" type="button">恢复默认（清空覆盖）</button>
+    </details>
+  </fieldset>
   <div class="setinfo">局域网访问（手机/其他设备）：<code id="setLan"></code><br>当前令牌：<code id="setToken"></code></div>
   <div class="row">
     <button id="setCancel">取消</button>

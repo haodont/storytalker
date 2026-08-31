@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ArcOutline, CharacterCard, CharacterState, DiceCheck, ForeshadowEntry, LedgerEntry, RuntimeSettings, SceneReport, StoryDesign, WorldEntity } from "./types.js";
-import { ENGINE } from "../config.js";
+import { ENGINE, normalizeLlm } from "../config.js";
 import { findEconomyTemplate } from "../economy/templates.js";
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,23 @@ export class Store {
 		return md.slice(-chars);
 	}
 
+	/** 全部已写场景原文（导出用）：按场景号升序，返回去除标题行的正文与标题 */
+	async readAllScenes(): Promise<{ scene: number; title: string; text: string }[]> {
+		const files = (await this.listDir("章稿")).filter((f) => f.endsWith(".md"));
+		const out: { scene: number; title: string; text: string }[] = [];
+		for (const f of files) {
+			const m = f.match(/^场景-(\d+)\.md$/);
+			if (!m) continue;
+			const scene = Number(m[1]);
+			if (!Number.isInteger(scene) || scene < 1) continue;
+			const md = await this.readText(`章稿/${f}`);
+			if (md === null) continue;
+			const [, title, text] = md.match(/^# 场景\d+：(.*)\n\n([\s\S]*)$/u) ?? [, `场景${scene}`, md];
+			out.push({ scene, title: (title ?? `场景${scene}`).trim(), text: (text ?? "").trim() });
+		}
+		return out.sort((a, b) => a.scene - b.scene);
+	}
+
 	async saveArcSummary(text: string): Promise<void> {
 		const prev = (await this.readText("记忆/弧摘要.md")) ?? "";
 		await this.writeText("记忆/弧摘要.md", prev + text + "\n");
@@ -331,6 +348,7 @@ export class Store {
 			scenesPerArc: Math.min(50, Math.max(2, Math.round(Number(saved?.scenesPerArc) || ENGINE.scenesPerArc))),
 			maxArcs: Math.min(20, Math.max(1, Math.round(Number(saved?.maxArcs) || ENGINE.maxArcs))),
 			webSearch: saved?.webSearch ?? true,
+			llm: normalizeLlm(saved?.llm),
 		};
 		return this.settingsCache;
 	}
