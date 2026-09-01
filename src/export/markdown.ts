@@ -14,6 +14,24 @@ export function exportMarkdown(title: string, scenes: { scene: number; title: st
 	return parts.join("\n");
 }
 
+/** 组装整本纯文本（TXT，通用记事本可读；每场景以标题行分隔，正文按自然段换行） */
+export function exportTxt(title: string, scenes: { scene: number; title: string; text: string }[]): string | null {
+	if (scenes.length === 0) return null;
+	const parts: string[] = [title || "未命名", ""];
+	for (const s of scenes) {
+		parts.push((s.title || `场景 ${s.scene}`) + "\n");
+		// 正文内联标题残留（场景文件首行 "场景N：标题" 已由 store 剥离，防御性清理其余标题行）
+		const text = s.text
+			.replace(/^#+ .*$/gm, "")
+			.split(/\n{2,}/)
+			.map((p) => p.trim())
+			.filter(Boolean)
+			.join("\n\n");
+		parts.push(text, "");
+	}
+	return parts.join("\n");
+}
+
 /** 组装单文件 HTML（阅读友好，可离线打开；样式内联零外链） */
 export function exportHtml(title: string, scenes: { scene: number; title: string; text: string }[]): string | null {
 	if (scenes.length === 0) return null;

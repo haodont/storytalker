@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Engine, type EngineEvent } from "../engine/engine.js";
 import type { GameState, RuntimeSettings, LlmSettings } from "../facts/types.js";
 import { Store } from "../facts/store.js";
-import { exportHtml, exportMarkdown } from "../export/markdown.js";
+import { exportHtml, exportMarkdown, exportTxt } from "../export/markdown.js";
 import { createLlm, createMockLlm, specFromSettings } from "../llm.js";
 import { normalizeLlm } from "../config.js";
 
@@ -522,6 +522,13 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 			const html = exportHtml(title, scenes);
 			res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(title)}.html` });
 			res.end(html);
+			return;
+		}
+		if (format === "txt") {
+			const txt = exportTxt(title, scenes);
+			if (txt === null) return json(res, 200, { ok: false, message: "导出失败" });
+			res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(title)}.txt` });
+			res.end(txt);
 			return;
 		}
 		const md = exportMarkdown(title, scenes);

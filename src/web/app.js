@@ -823,6 +823,7 @@ async function downloadExport(format) {
   a.remove();
   URL.revokeObjectURL(a.href);
 }
+$("exportTxt").onclick = () => downloadExport("txt");
 $("exportMd").onclick = () => downloadExport("md");
 $("exportHtml").onclick = () => downloadExport("html");
 

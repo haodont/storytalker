@@ -1,7 +1,7 @@
 // 导出组装单测：MD / HTML 输出结构与转义。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { exportMarkdown, exportHtml } from "./markdown.js";
+import { exportMarkdown, exportHtml, exportTxt } from "./markdown.js";
 
 const scenes = [
 	{ scene: 1, title: "城门初遇", text: "暮色里，沈青梧推开木门。\n\n风从巷口灌进来。" },
@@ -36,4 +36,24 @@ test("exportHtml：特殊字符转义（防注入）", () => {
 	assert.ok(html.includes("标题 &lt;x&gt;"));
 	assert.ok(html.includes("正文 &amp; &quot;引号&quot;"));
 	assert.ok(!html.includes("<x>"));
+});
+
+test("exportTxt：空书返回 null", () => {
+	assert.equal(exportTxt("书", []), null);
+});
+
+test("exportTxt：书名 + 场景标题行 + 段落合并，无 Markdown 标记", () => {
+	const txt = exportTxt("《风起》", scenes)!;
+	assert.ok(txt.startsWith("《风起》"));
+	assert.ok(txt.includes("城门初遇"));
+	assert.ok(txt.includes("暮色里，沈青梧推开木门。"));
+	assert.ok(txt.includes("风从巷口灌进来。"));
+	assert.ok(!txt.includes("##"));
+});
+
+test("exportTxt：正文中的残留标题行被清除", () => {
+	const txt = exportTxt("书", [{ scene: 3, title: "夜话", text: "正文第一段。\n\n# 残留标题\n\n正文第二段。" }])!;
+	assert.ok(!txt.includes("残留标题"));
+	assert.ok(txt.includes("正文第一段"));
+	assert.ok(txt.includes("正文第二段"));
 });
