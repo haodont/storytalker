@@ -5,22 +5,29 @@
 
 ---
 
-## 📍 执行进度（2026-08-31 更新）
+## 📍 执行进度（2026-09-01 更新）
 
 | 任务 | 状态 | 实际结果 |
 |---|---|---|
 | **P2-3** 安全止血 | ✅ 完成 | `.gitignore` 改通配；**已扫描确认历史无 Key 泄露** |
-| **P1-1** 统一错误处理 | ✅ 完成 | 静默吞错 **8 处 → 0 处** |
-| **P1-2** 单测骨架 | 🟡 大部分完成 | `npm test` 可用（零新依赖），**21 个用例全通过**（计划 ≥25，缺 `store.ts` 的 5 个） |
-| P1-3 engine 拆分 | ⬜ 未开始 | 硬阻塞于 P1-2 收尾 |
-| P2-1 / P2-2 | ⬜ 未开始 | 串行组，待 P1 收尾后启动 |
-| P3-1 / P3-2 / P3-3 | ⬜ 未开始 | P3-1 已确认可走真中断（假设 E） |
+| **P1-1** 统一错误处理 | ✅ 完成 | 静默吞错 **8 处 → 0 处**；`messageText` 改读 `errorMessage`（假设 B 的真实缺陷） |
+| **P1-2** 单测骨架 | ✅ 完成 | **69 用例**（config 17 / settle 10 / store 17 / validate 12 / context 6 / export 7），覆盖 6 模块（计划要求 4） |
+| **P1-3** engine 拆分 | ⚠️ 部分完成 | 拆出 `validate.ts`（校验门禁）+ `state.ts`（状态工厂/归一化），`engine.ts` 1067→917 行。**`reviseArc`/`resolveChoice` 未拆**，详见下方遗留 |
+| **P2-1** CAP 动态化 | ✅ 完成 | `capsFor(ctxWin)`（scale 0.5–4 夹逼），16k 与历史值逐字段一致；`Engine.syncCaps()` 取三角色最小窗口 |
+| **P2-2** 角色模型/温度 | ✅ 完成 | `LlmSettings.roles`；openai 分支首次获得按角色温度（原实现在线温度从未生效） |
+| **P3-1** 生成中断 | ✅ 完成 | `AbortController` 贯穿 11 处 agent 调用 + `/api/abort` + 前端「■ 停止」 |
+| **P3-2** 导出 | ✅ 完成 | **TXT / MD / HTML** 三格式（EPUB 按用户决定不做） |
+| **P3-3** webSearch 加固 | ✅ 完成 | 双源并行（原串行）、同域限频 1s、失败原因留痕 |
 
-**门禁状态**：`typecheck` ✅ · `npm test` 21/21 ✅ · `npm run e2e` 42 项 ✅ · `npm run e2e:web` 23 项 ✅
+**门禁状态**：`typecheck` ✅ · `npm test` **69/69** ✅ · `npm run e2e` ✅ · `npm run e2e:web` ✅ · 已推送远程 `a1e308a`
 
 **执行中新增的发现**（详见 §7）：
 - 两个 E2E 脚本原用固定工作区目录，残留会导致**开头清理就抛错**（测试根本没跑）和**假失败**。已改 `mkdtemp` 临时目录。
 - 假设 **B/C/D/E 已全部核实**，其中 B 是真实缺陷（已修）。
+
+**遗留（需人工介入）**：
+1. `reviseArc`(~230 行) / `resolveChoice`(~230 行) 拆分 —— 二者深度耦合 `this.state` / `pipelineBusy` / `diceBudget` / `proc` / `setPhase`。TS 私有成员在模块外不可访问，强拆需先引入显式 context 传参（`{ store, llm, emit, state, ... }`）或放宽封装，属"改逻辑"而非"搬代码"，**超出 AI 安全自动搬移范围**，建议人工重写。已折中拆出可安全提取的纯逻辑（validate/state）作为补偿。
+2. `webSearch` 的 HTML 正则对上游页面结构敏感，失败已留痕（日志前缀 `[webSearch]`），结构变更后需人工跟进正则。
 
 ---
 
