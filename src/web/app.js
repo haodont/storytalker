@@ -269,6 +269,8 @@ function renderEvent(ev) {
       break;
     }
     case "choices":
+      // 自动模式下由引擎按 recommended 推进，前端不渲染选项面板（不中断阅读流）
+      if (lastMode === "auto") break;
       state.pendingChoices = ev.choices;
       renderFooter();
       newSep("你的选择", "choice");
