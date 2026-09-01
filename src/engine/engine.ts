@@ -348,6 +348,8 @@ export class Engine {
 		{ key: "firstArcGoal", label: "第一弧目标", hint: "主角要达成什么？面临什么挑战？" },
 		{ key: "conflictSource", label: "冲突来源", hint: "外部威胁、内部矛盾、谜题、成长考验..." },
 		{ key: "audience", label: "目标读者", hint: "影响写作风格和内容尺度（如：青少年、成人、网文读者）" },
+		{ key: "socialEnvironment", label: "社会环境", hint: "社会阶层、权力结构、文化习俗、法律制度、技术水平..." },
+		{ key: "economicSystem", label: "经济体系", hint: "货币制度、贸易路线、主要产业、贫富差距、物价水平..." },
 	] as const;
 
 	/** 当前模板对话记录 */

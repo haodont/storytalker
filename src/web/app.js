@@ -614,8 +614,21 @@ async function refreshWorlds() {
       location.href = u.toString();
     };
     else enter.disabled = true;
+    const del = document.createElement("button");
+    del.className = "w-del";
+    del.textContent = "删除";
+    del.title = w.id === SESSION ? "当前世界不能删除" : "删除该世界及其全部存档（不可撤销）";
+    if (w.id === SESSION) del.disabled = true;
+    else del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!(await confirmEl.ask("确认删除世界「" + w.id + "」？此操作不可撤销，全部存档将永久丢失。"))) return;
+      const r = await fetch("/api/worlds?id=" + encodeURIComponent(w.id), { method: "DELETE", headers: { authorization: "Bearer " + TOKEN } }).then((x) => x.json());
+      toastsEl.show(r && r.ok ? r.message : (r && r.message) || "删除失败", r && r.ok ? "ok" : "err");
+      if (r && r.ok) await refreshWorlds();
+    };
     row.appendChild(info);
     row.appendChild(enter);
+    row.appendChild(del);
     row.onclick = () => { selectedWorld = w.id; markCurrent(); loadSaveTree(w.id); };
     worldListEl.appendChild(row);
   }

@@ -210,6 +210,10 @@ export interface PremiseTemplate {
 	conflictSource: string;
 	/** 目标读者/受众（影响写作风格和内容尺度） */
 	audience: string;
+	/** 社会环境（社会阶层、权力结构、文化习俗、法律制度、技术水平...） */
+	socialEnvironment: string;
+	/** 经济体系（货币制度、贸易路线、主要产业、贫富差距、物价水平...） */
+	economicSystem: string;
 	/** 参考作品（风格参考，可选） */
 	reference?: string;
 	/** 补充说明（任何其他重要设定） */

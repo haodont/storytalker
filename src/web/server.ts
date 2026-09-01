@@ -101,18 +101,20 @@ export class SessionManager {
 		return { ok: true, message: `已创建世界「${id}」` };
 	}
 
-	/** 删除世界（含其全部存档/进度）。运行中（已 boot）的世界拒绝删除，避免引擎状态与目录不一致 */
+	/** 删除世界（含其全部存档/进度）。正在推进剧情（写作/校对/结算）的引擎不可删，避免目录与内存状态错位；其余空闲世界清退内存后删除 */
 	async deleteWorld(id: string): Promise<{ ok: boolean; message?: string }> {
 		if (!SESSION_ID_RE.test(id)) return { ok: false, message: "世界名不合法" };
 		if (id === "main") return { ok: false, message: "不能删除主世界 main" };
-		if (this.booting.has(id) || this.sessions.has(id)) {
-			return { ok: false, message: `世界「${id}」正在运行，请先切换到其他世界再删除` };
-		}
 		const root = this.sessionRoot(id);
 		if (!existsSync(root)) return { ok: false, message: `世界「${id}」不存在` };
-		await rm(root, { recursive: true, force: true });
+		const hub = this.sessions.get(id);
+		if (hub && hub.engine.isBusy) {
+			return { ok: false, message: `世界「${id}」正在推进剧情，请稍后再删` };
+		}
+		// 从内存清退，后续若再进入会重新从零 boot
 		this.sessions.delete(id);
 		this.booting.delete(id);
+		await rm(root, { recursive: true, force: true });
 		return { ok: true, message: `已删除世界「${id}」` };
 	}
 
