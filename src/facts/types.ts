@@ -51,7 +51,7 @@ export interface WorldEntity {
 }
 
 /** 引擎阶段（只前进，回退通过读档实现） */
-export type Phase = "empty" | "idea_chat" | "bootstrapping" | "confirm_bible" | "playing" | "arc_boundary" | "ended";
+export type Phase = "empty" | "premise_chat" | "idea_chat" | "bootstrapping" | "confirm_bible" | "playing" | "arc_boundary" | "ended";
 
 export type PlayMode = "auto" | "manual";
 
@@ -188,6 +188,32 @@ export interface StoryDesign {
 	arc: ArcOutline;
 	/** 第一场怎么开场（唯一预排的拍子） */
 	openingBeat: string;
+}
+
+// ---------------------------------------------------------------------------
+// 开局模板：通过多轮对话结构化收集故事前提，Director 据此生成完整设计
+// ---------------------------------------------------------------------------
+
+/** 开局模板：多轮对话结构化收集的故事前提 */
+export interface PremiseTemplate {
+	/** 故事类型/题材（如：都市异能、历史、科幻、奇幻） */
+	genre: string;
+	/** 主角设定（名字、性格、背景、能力） */
+	protagonist: string;
+	/** 世界观设定（时代、地点、社会结构、特殊规则） */
+	worldSetting: string;
+	/** 故事基调（轻松、悬疑、史诗、黑暗...） */
+	tone: string;
+	/** 第一弧目标（主角要达成什么） */
+	firstArcGoal: string;
+	/** 故事冲突来源（外部威胁、内部矛盾、谜题、成长...） */
+	conflictSource: string;
+	/** 目标读者/受众（影响写作风格和内容尺度） */
+	audience: string;
+	/** 参考作品（风格参考，可选） */
+	reference?: string;
+	/** 补充说明（任何其他重要设定） */
+	additionalNotes?: string;
 }
 
 /** 引擎全局状态（小而完整，序列化到存档；大事实都在文件里） */

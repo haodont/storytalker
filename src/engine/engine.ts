@@ -271,6 +271,9 @@ export class Engine {
 	/** 用户主动中断标志：让 void() 把中止识别为正常操作而非引擎错误 */
 	private aborting = false;
 
+	/** 开局模板（premise_chat 阶段累积，构建后用于 Director 设计） */
+	private template: Partial<import("../facts/types.js").PremiseTemplate> = {};
+
 	/** 中断当前生成：流式调用以 aborted 收尾，引擎回到上一个稳定态（中断点由存档恢复机制兜底） */
 	abortGeneration(): boolean {
 		if (!this.currentAbort) return false;
@@ -330,6 +333,141 @@ export class Engine {
 		} finally {
 			this.ideaBusy = false;
 		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// 开局模板多轮对话：结构化收集故事前提，Director 据此生成完整设计
+	// ---------------------------------------------------------------------------
+
+	/** 开局模板字段列表（按对话顺序收集） */
+	private static readonly TEMPLATE_FIELDS = [
+		{ key: "genre", label: "故事类型", hint: "如：都市异能、历史、科幻、奇幻、悬疑、爱情" },
+		{ key: "protagonist", label: "主角设定", hint: "名字、性格、背景、能力、动机" },
+		{ key: "worldSetting", label: "世界观", hint: "时代、地点、社会结构、特殊规则、魔法体系..." },
+		{ key: "tone", label: "故事基调", hint: "轻松幽默、悬疑紧张、史诗宏大、黑暗沉重、温馨治愈..." },
+		{ key: "firstArcGoal", label: "第一弧目标", hint: "主角要达成什么？面临什么挑战？" },
+		{ key: "conflictSource", label: "冲突来源", hint: "外部威胁、内部矛盾、谜题、成长考验..." },
+		{ key: "audience", label: "目标读者", hint: "影响写作风格和内容尺度（如：青少年、成人、网文读者）" },
+	] as const;
+
+	/** 当前模板对话记录 */
+	private premiseMsgs: { role: "user" | "assistant"; text: string }[] = [];
+
+	/** 模板对话互斥锁 */
+	private premiseBusy = false;
+
+	/** 当前填写到哪个字段（0-based，-1 表示已完成） */
+	private templateFieldIndex = -1;
+
+	/** 多轮对话收集开局模板：逐字段引导，直到模板完成 */
+	async chatPremise(text: string): Promise<void> {
+		if (this.state.phase !== "empty" && this.state.phase !== "premise_chat") return;
+		if (this.premiseBusy) {
+			this.emit({ type: "status", text: "导播正在回复，稍等它说完……" });
+			return;
+		}
+		this.premiseBusy = true;
+		try {
+			if (this.state.phase === "empty") {
+				await this.setPhase("premise_chat");
+				this.templateFieldIndex = 0;
+				// 首次进入：发送欢迎消息和第一个字段引导
+				const firstField = Engine.TEMPLATE_FIELDS[0];
+				const welcome = `【开局模板】我需要了解你的故事构想，一共 ${Engine.TEMPLATE_FIELDS.length} 个问题，逐个回答即可。\n\n第一个问题：${firstField.label}\n（${firstField.hint}）`;
+				this.premiseMsgs.push({ role: "assistant", text: welcome });
+				this.emit({ type: "idea_done", text: welcome });
+				return;
+			}
+
+			// 记录用户回答
+			this.premiseMsgs.push({ role: "user", text });
+
+			// 尝试从回答中提取当前字段的值
+			const currentField = Engine.TEMPLATE_FIELDS[this.templateFieldIndex];
+			if (currentField) {
+				(this.template as any)[currentField.key] = text.trim();
+			}
+
+			// 移动到下一个字段
+			this.templateFieldIndex++;
+
+			// 检查是否所有字段都已完成
+			if (this.templateFieldIndex >= Engine.TEMPLATE_FIELDS.length) {
+				// 模板完成：显示摘要并询问是否开始设计
+				const summary = this.buildTemplateSummary();
+				const completionMsg = `【模板完成】你的故事构想：\n\n${summary}\n\n输入「开始」生成完整开局设计；或输入修改意见调整模板。`;
+				this.premiseMsgs.push({ role: "assistant", text: completionMsg });
+				this.emit({ type: "idea_done", text: completionMsg });
+				this.templateFieldIndex = -1; // 标记完成
+				return;
+			}
+
+			// 引导下一个字段
+			const nextField = Engine.TEMPLATE_FIELDS[this.templateFieldIndex];
+			if (!nextField) {
+				this.templateFieldIndex = -1;
+				return;
+			}
+			const progress = `[${this.templateFieldIndex + 1}/${Engine.TEMPLATE_FIELDS.length}]`;
+			const guide = `${progress} 下一个问题：${nextField.label}\n（${nextField.hint}）`;
+			this.premiseMsgs.push({ role: "assistant", text: guide });
+			this.emit({ type: "idea_done", text: guide });
+
+			await this.commit();
+		} finally {
+			this.premiseBusy = false;
+		}
+	}
+
+	/** 构建模板摘要（Markdown 格式） */
+	private buildTemplateSummary(): string {
+		const fields = Engine.TEMPLATE_FIELDS;
+		return fields.map((f) => {
+			const value = (this.template as any)[f.key] ?? "（未填写）";
+			return `**${f.label}**：${value}`;
+		}).join("\n");
+	}
+
+	/** 从模板构建开局：将模板转为一句话前提，调用 startPremise */
+	async buildFromPremise(): Promise<void> {
+		if (this.state.phase !== "premise_chat") return;
+
+		// 检查模板是否完整
+		const requiredFields = Engine.TEMPLATE_FIELDS;
+		const missing = requiredFields.filter((f) => !(this.template as any)[f.key]?.trim());
+		if (missing.length > 0) {
+			this.emit({ type: "error", message: `模板未完成：${missing.map((f) => f.label).join("、")} 未填写` });
+			return;
+		}
+
+		// 构建一句话前提
+		const premise = [
+			this.template.genre,
+			`主角${this.template.protagonist}`,
+			this.template.worldSetting,
+			`基调${this.template.tone}`,
+			this.template.firstArcGoal,
+		].join("，");
+
+		// 保存模板到 store（备查）
+		await this.store.writeJson("设定/开局模板.json", this.template);
+
+		// 调用现有的 startPremise
+		await this.startPremise(premise);
+	}
+
+	/** 模板修改：允许用户直接修改模板字段 */
+	async modifyTemplate(field: string, value: string): Promise<void> {
+		if (this.state.phase !== "premise_chat") return;
+		const validField = Engine.TEMPLATE_FIELDS.find((f) => f.key === field);
+		if (!validField) {
+			this.emit({ type: "error", message: `未知字段：${field}。可修改字段：${Engine.TEMPLATE_FIELDS.map((f) => f.key).join("、")}` });
+			return;
+		}
+		(this.template as any)[field] = value.trim();
+		const confirmMsg = `已更新「${validField.label}」：${value.trim()}`;
+		this.emit({ type: "status", text: confirmMsg });
+		await this.commit();
 	}
 
 	/** 结束酝酿，把积累的对话交给导播正式设计开局 */

@@ -31,6 +31,48 @@
 
 ---
 
+## 附录：开局模板功能（2026-09-01 新增）
+
+**新增类型**：`PremiseTemplate`（`src/facts/types.ts`）
+
+```typescript
+export interface PremiseTemplate {
+  genre: string;           // 故事类型/题材
+  protagonist: string;     // 主角设定
+  worldSetting: string;    // 世界观设定
+  tone: string;            // 故事基调
+  firstArcGoal: string;    // 第一弧目标
+  conflictSource: string;  // 冲突来源
+  audience: string;        // 目标读者
+  reference?: string;      // 参考作品
+  additionalNotes?: string; // 补充说明
+}
+```
+
+**新增状态**：`premise_chat`（`src/facts/types.ts` Phase 类型）
+
+**新增 Engine 方法**：
+- `chatPremise(text)` — 多轮对话收集模板字段
+- `buildFromPremise()` — 从模板构建开局
+- `modifyTemplate(field, value)` — 修改模板字段
+
+**流程**：
+```
+empty → premise_chat（多轮对话完善模板）→ bootstrapping → confirm_bible → playing
+```
+
+**前端交互**：
+- `premise_chat` 阶段使用 `idea_done` 事件渲染对话
+- 用户输入「开始」触发 `buildFromPremise`
+- 用户输入「修改 字段=值」触发 `modifyTemplate`
+
+**向后兼容**：
+- 旧存档自动转换（`normalizeState` 兜底）
+- 保留 `idea_chat` 路径作为备选（直接输入灵感）
+
+
+---
+
 ## 0. 已核实的事实基线（写计划前实测，非推断）
 
 | # | 事实 | 证据 |

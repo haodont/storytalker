@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createReadStream, existsSync, readdirSync } from "node:fs";
-import { cp } from "node:fs/promises";
+import { cp, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Engine, type EngineEvent } from "../engine/engine.js";
@@ -99,6 +99,21 @@ export class SessionManager {
 		if (existsSync(this.sessionRoot(id))) return { ok: false, message: `世界「${id}」已存在` };
 		await this.get(id); // boot 空工作区（ensureWorkspace 建目录）
 		return { ok: true, message: `已创建世界「${id}」` };
+	}
+
+	/** 删除世界（含其全部存档/进度）。运行中（已 boot）的世界拒绝删除，避免引擎状态与目录不一致 */
+	async deleteWorld(id: string): Promise<{ ok: boolean; message?: string }> {
+		if (!SESSION_ID_RE.test(id)) return { ok: false, message: "世界名不合法" };
+		if (id === "main") return { ok: false, message: "不能删除主世界 main" };
+		if (this.booting.has(id) || this.sessions.has(id)) {
+			return { ok: false, message: `世界「${id}」正在运行，请先切换到其他世界再删除` };
+		}
+		const root = this.sessionRoot(id);
+		if (!existsSync(root)) return { ok: false, message: `世界「${id}」不存在` };
+		await rm(root, { recursive: true, force: true });
+		this.sessions.delete(id);
+		this.booting.delete(id);
+		return { ok: true, message: `已删除世界「${id}」` };
 	}
 
 	/** 某个世界的存档树（直接读盘，不 boot） */
@@ -303,6 +318,20 @@ export class WebHub {
 			}
 			return { ok: true };
 		}
+		if (s.phase === "premise_chat") {
+			// 开局模板多轮对话
+			// 「开始」= 模板完成，进入设计；「修改 字段=值」= 修改模板字段
+			const startMatch = text.match(/^开始$/);
+			const modifyMatch = text.match(/^修改\s+(\w+)\s*[=：]\s*(.+)$/);
+			if (startMatch) {
+				this.run(this.engine.buildFromPremise(), "开局设计");
+			} else if (modifyMatch && modifyMatch[1] && modifyMatch[2]) {
+				this.run(this.engine.modifyTemplate(modifyMatch[1], modifyMatch[2]), "模板修改");
+			} else {
+				this.run(this.engine.chatPremise(text), "模板对话");
+			}
+			return { ok: true };
+		}
 		if (s.phase === "confirm_bible") {
 			this.run(this.engine.confirmBible(text), "设定确认");
 			return { ok: true };
@@ -427,6 +456,10 @@ async function route(sessions: SessionManager, req: IncomingMessage, res: Server
 	if (req.method === "POST" && pathname === "/api/worlds") {
 		const body = await readJson(req);
 		return json(res, 200, await sessions.createWorld(String(body.id ?? "")));
+	}
+	if (req.method === "DELETE" && pathname === "/api/worlds") {
+		const id = url.searchParams.get("id") ?? "";
+		return json(res, 200, await sessions.deleteWorld(id));
 	}
 
 	const hub = await sessions.get(sessionId);
