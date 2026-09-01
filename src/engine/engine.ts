@@ -430,7 +430,7 @@ export class Engine {
 		}).join("\n");
 	}
 
-	/** 从模板构建开局：将模板转为一句话前提，调用 startPremise */
+	/** 从模板构建开局：将模板转为结构化描述，传给 Director 设计 */
 	async buildFromPremise(): Promise<void> {
 		if (this.state.phase !== "premise_chat") return;
 
@@ -442,20 +442,32 @@ export class Engine {
 			return;
 		}
 
-		// 构建一句话前提
-		const premise = [
-			this.template.genre,
-			`主角${this.template.protagonist}`,
-			this.template.worldSetting,
-			`基调${this.template.tone}`,
-			this.template.firstArcGoal,
-		].join("，");
+		// 构建结构化前提描述（包含所有模板信息）
+		const premise = this.buildStructuredPremise();
 
 		// 保存模板到 store（备查）
 		await this.store.writeJson("设定/开局模板.json", this.template);
 
-		// 调用现有的 startPremise
+		// 调用 startPremise 传入结构化描述
 		await this.startPremise(premise);
+	}
+
+	/** 构建结构化前提描述：包含社会环境和经济体系的完整信息 */
+	private buildStructuredPremise(): string {
+		const t = this.template;
+		return [
+			`【故事类型】${t.genre}`,
+			`【主角设定】${t.protagonist}`,
+			`【世界观】${t.worldSetting}`,
+			`【故事基调】${t.tone}`,
+			`【第一弧目标】${t.firstArcGoal}`,
+			`【冲突来源】${t.conflictSource}`,
+			`【目标读者】${t.audience}`,
+			`【社会环境】${t.socialEnvironment}`,
+			`【经济体系】${t.economicSystem}`,
+			t.reference ? `【参考作品】${t.reference}` : "",
+			t.additionalNotes ? `【补充说明】${t.additionalNotes}` : "",
+		].filter(Boolean).join("\n");
 	}
 
 	/** 模板修改：允许用户直接修改模板字段 */
