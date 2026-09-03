@@ -104,6 +104,22 @@ async function main(): Promise<void> {
 	});
 	check("SSE 握手与重放", sseOk);
 
+	// 9) 开局模板多轮对话入口
+	//    回归防线：Web 端曾因 phase 死锁完全无法进入该流程——handleInput 只在 phase 已是
+	//    premise_chat 时才调 chatPremise，而 premise_chat 只能由 chatPremise 自身设置。
+	const newWorld = (await (await fetch(auth("/api/worlds"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "premise-e2e" }) })).json()) as { ok: boolean; message?: string };
+	check("新建空白世界", newWorld.ok === true);
+	const preCmd = (await (await fetch(auth("/api/command") + "&session=premise-e2e", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cmd: "premise" }) })).json()) as { ok: boolean; message?: string };
+	check("premise 命令可进入模板阶段", preCmd.ok === true);
+	const preState = (await (await fetch(auth("/api/state") + "&session=premise-e2e")).json()) as { state: { phase: string } };
+	check("模板阶段 phase=premise_chat", preState.state.phase === "premise_chat");
+	await (await fetch(auth("/api/input") + "&session=premise-e2e", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "赛博朋克" }) })).json();
+	const preLog = (await (await fetch(auth("/api/events.json") + "&session=premise-e2e")).json()) as { type: string; text?: string }[];
+	check("模板回答推进到下一字段", preLog.some((e) => e.type === "idea_done" && /\[2\/\d+\]/.test(e.text ?? "")));
+	// 非开局阶段须明确报错，不能静默无动作（引擎对越阶段调用是 return，反馈只能在此层补）
+	const preLate = (await (await fetch(auth("/api/command"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cmd: "premise" }) })).json()) as { ok: boolean; message?: string };
+	check("非开局阶段拒绝 premise 且给出原因", preLate.ok === false && !!preLate.message);
+
 	console.log("\n—— Web E2E 断言 ——");
 	let failed = 0;
 	for (const line of results) {
