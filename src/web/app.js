@@ -25,11 +25,22 @@ const state = {
 };
 let lastBootCard = null; // 当前显示的开局设定卡（新卡替换旧卡）
 let ideaStreaming = null; // 灵感对话流式块
+let ideaStreamNode = null; // 灵感流式文本节点（直接持有引用，避免按索引取 childNodes）
 let ideaStreamBuf = "";
 
 // ---------- token ----------
 const SESSION = new URLSearchParams(location.search).get("session") || "main";
 let TOKEN = localStorage.getItem("novel_token") || "";
+
+/** 统一拼装带鉴权与会话的 API 地址：SSE/下载等无法带请求头的场景也走这里，避免各处手拼 query */
+function apiUrl(path, params) {
+  const u = new URL(path, location.origin);
+  if (TOKEN) u.searchParams.set("token", TOKEN);
+  u.searchParams.set("session", SESSION);
+  if (params) for (const k of Object.keys(params)) u.searchParams.set(k, params[k]);
+  return u.pathname + u.search;
+}
+
 async function ensureToken() {
   // URL ?token= 优先（内嵌浏览器等不支持 prompt() 的环境靠它登录）
   const urlToken = new URLSearchParams(location.search).get("token");
@@ -38,9 +49,15 @@ async function ensureToken() {
     localStorage.setItem("novel_token", TOKEN);
   }
   if (TOKEN) {
-    const r = await fetch("/api/state?token=" + encodeURIComponent(TOKEN) + "&session=" + encodeURIComponent(SESSION));
+    const r = await fetch(apiUrl("/api/state"));
     if (r.status !== 401) return true;
+    // 令牌已失效，清掉重新走鉴权流程
+    TOKEN = "";
+    localStorage.removeItem("novel_token");
   }
+  // 无令牌时先探测：鉴权关闭（未设 WEB_TOKEN）则直接放行，避免误弹令牌墙
+  const probe = await fetch(apiUrl("/api/state")); // 走到这 TOKEN 必为空 → 即「空令牌探测」
+  if (probe.status !== 401) return true;
   let t = null;
   try { t = await confirmEl.ask("请输入访问令牌（WEB_TOKEN）", { input: true }); } catch (e) { /* 组件未就绪等 */ }
   if (!t) {
@@ -95,7 +112,7 @@ function newSep(text, variant) {
 }
 
 const PHASE_NAMES = {
-  empty: "等待灵感", idea_chat: "灵感酝酿", bootstrapping: "导播设计中", confirm_bible: "开局待确认",
+  empty: "等待灵感", premise_chat: "模板填写", idea_chat: "灵感酝酿", bootstrapping: "导播设计中", confirm_bible: "开局待确认",
   playing: "进行中", arc_boundary: "弧收束中", ended: "已完结", connecting: "连接中",
 };
 
@@ -147,7 +164,8 @@ $("stopBtn").onclick = async () => {
 };
 
 function hintFor() {
-  if (state.phase === "empty") return "随便聊聊你的灵感（题材/主角/想要的基调），聊透了再构建；也可输入「构建：一句话」直接开工";
+  if (state.phase === "empty") return "随便聊聊你的灵感（题材/主角/想要的基调），聊透了再构建；也可输入「构建：一句话」直接开工，或用菜单「用模板开局」逐项填写";
+  if (state.phase === "premise_chat") return "逐项回答导播的问题；填完输入「开始」生成开局设定，或「修改 字段名=值」调整某一项";
   if (state.phase === "idea_chat") return "继续和导播聊；满意后点菜单「开始构建开局」，或输入「构建：补充要求」";
   if (state.phase === "confirm_bible") return "输入修改意见让导播调整，或点菜单里的「确认开局」";
   if (state.phase === "playing" && state.pendingChoices) return "点上方选项（或按数字键 1-3）、输入「大纲：意见」调整右侧大纲，或直接描述你想要的走向";
@@ -207,23 +225,28 @@ function renderEvent(ev) {
       }
       break;
 
-    case "idea_user":
-      if (ideaStreaming) { ideaStreaming.classList.remove("cursor"); ideaStreaming = null; }
-      newBlock("chat me", "").innerHTML = '<span class="who">你</span>';
-      reader.lastChild.insertAdjacentText("beforeend", ev.text);
+    case "idea_user": {
+      if (ideaStreaming) { ideaStreaming.classList.remove("cursor"); ideaStreaming = null; ideaStreamNode = null; }
+      // 用 newBlock 返回的引用，不依赖 reader.lastChild（mountBlock 超限时会淘汰最老块）
+      const b = newBlock("chat me", "");
+      b.innerHTML = '<span class="who">你</span>';
+      b.insertAdjacentText("beforeend", ev.text);
       break;
+    }
     case "idea_delta":
       if (!ideaStreaming) {
         ideaStreaming = newBlock("chat", "");
         ideaStreaming.innerHTML = '<span class="who">顾问</span>';
-        ideaStreaming.appendChild(document.createTextNode(""));
+        ideaStreamNode = document.createTextNode("");
+        ideaStreaming.appendChild(ideaStreamNode);
         ideaStreaming.classList.add("cursor");
         ideaStreamBuf = "";
       }
       {
         const stick = nearBottom();
+        // 同 scene_delta：只动增量文本节点，不整块重写
         ideaStreamBuf += ev.text;
-        ideaStreaming.childNodes[1].textContent = ideaStreamBuf + " ";
+        ideaStreamNode.data = ideaStreamBuf + " ";
         setBusy(true);
         if (stick) scrollNow();
       }
@@ -232,8 +255,9 @@ function renderEvent(ev) {
       setBusy(false);
       if (ideaStreaming) {
         ideaStreaming.classList.remove("cursor");
-        ideaStreaming.childNodes[1].textContent = ev.text;
+        ideaStreamNode.data = ev.text;
         ideaStreaming = null;
+        ideaStreamNode = null;
       } else {
         const c = newBlock("chat", "");
         c.innerHTML = '<span class="who">顾问</span>';
@@ -322,7 +346,7 @@ function applyTheme(t) {
   localStorage.setItem("novel_theme", t);
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.content = t === "paper" ? "#f5f1e8" : "#141416";
-  $("themeBtn").textContent = t === "paper" ? "夜" : "纸";
+  $("themeBtn").textContent = t === "paper" ? "纸质" : "夜间";
 }
 $("themeBtn").onclick = () => applyTheme(document.documentElement.dataset.theme === "paper" ? "dark" : "paper");
 applyTheme(localStorage.getItem("novel_theme") === "paper" ? "paper" : "dark");
@@ -353,16 +377,25 @@ jumpBtn.onclick = () => { document.documentElement.style.scrollBehavior = "smoot
 const footerEl = document.querySelector("footer");
 const processEl = document.getElementById("process");
 const mainEl = document.querySelector("main");
+let lastLayoutSig = "";
 function syncLayoutVars() {
   const mr = mainEl.getBoundingClientRect();
   const cs = getComputedStyle(mainEl);
   const pl = parseFloat(cs.paddingLeft) || 0;
   const pr = parseFloat(cs.paddingRight) || 0;
-  document.documentElement.style.setProperty("--footer-h", footerEl.offsetHeight + "px");
   // composer 的 margin 相对 footer 内容盒（其左缘已含 footer 内边距），需把该内边距扣掉
   const fpad = parseFloat(getComputedStyle(footerEl).paddingLeft) || 0;
-  document.documentElement.style.setProperty("--main-left", (mr.left + pl - fpad) + "px");
-  document.documentElement.style.setProperty("--main-w", (mr.width - pl - pr) + "px");
+  const h = footerEl.offsetHeight + "px";
+  const left = (mr.left + pl - fpad) + "px";
+  const w = (mr.width - pl - pr) + "px";
+  // 800ms 轮询兜底：值未变则不写样式，避免无谓的样式失效触发重排
+  const sig = h + "|" + left + "|" + w;
+  if (sig === lastLayoutSig) return;
+  lastLayoutSig = sig;
+  const rs = document.documentElement.style;
+  rs.setProperty("--footer-h", h);
+  rs.setProperty("--main-left", left);
+  rs.setProperty("--main-w", w);
 }
 // 内嵌浏览器可能节流 ResizeObserver，三重保险：RO + 渲染入口主动同步 + 低频轮询兜底
 if (typeof ResizeObserver === "function") {
@@ -457,8 +490,8 @@ async function refreshOutline() {
   const view = $("outlineView");
   // 本场大纲：本地事件状态，先渲染骨架再拉文件，避免面板闪空
   const [zong, arc] = await Promise.all([
-    api("/api/file?path=" + encodeURIComponent("大纲/总纲.md") + "&token=" + encodeURIComponent(TOKEN)),
-    api("/api/file?path=" + encodeURIComponent("大纲/弧-01.md") + "&token=" + encodeURIComponent(TOKEN)),
+    api("/api/file?path=" + encodeURIComponent("大纲/总纲.md")),
+    api("/api/file?path=" + encodeURIComponent("大纲/弧-01.md")),
   ]).catch(() => [null, null]);
   if (activeTab !== "outline") return; // 期间切走了
   view.replaceChildren();
@@ -486,13 +519,16 @@ async function refreshOutline() {
   renderSceneOutlineCard(view);
 }
 
-$("procToggle").onclick = () => $("process").classList.toggle("open");
-$("procClose").onclick = () => $("process").classList.remove("open");
+$("procToggle").onclick = () => {
+  const el = $("process");
+  el.classList.toggle("open");
+  $("procToggle").classList.toggle("active", el.classList.contains("open"));
+};
+$("procClose").onclick = () => { $("process").classList.remove("open"); $("procToggle").classList.remove("active"); };
 
 // ---------- API ----------
 async function api(path, body) {
-  const sep = path.includes("?") ? "&" : "?";
-  const r = await fetch(path + sep + "session=" + encodeURIComponent(SESSION), {
+  const r = await fetch(apiUrl(path), {
     method: body ? "POST" : "GET",
     headers: { "content-type": "application/json", authorization: "Bearer " + TOKEN },
     body: body ? JSON.stringify(body) : undefined,
@@ -514,28 +550,38 @@ input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(input.val
 // ---------- 菜单 ----------
 function menuItems() {
   const items = [];
-  if (state.phase === "idea_chat") items.push(["开始构建开局", () => command("build")]);
-  if (state.phase === "confirm_bible") items.push(["确认开局，开始故事", () => command("accept")]);
+  // —— 操作 ——
+  if (state.phase === "empty") items.push({ label: "用模板开局（逐项问答）", fn: () => command("premise") });
+  if (state.phase === "idea_chat") items.push({ label: "开始构建开局", fn: () => command("build") });
+  if (state.phase === "confirm_bible") items.push({ label: "确认开局，开始故事", fn: () => command("accept") });
   if (state.phase === "playing" || state.phase === "confirm_bible") {
-    items.push(["切换 自动/手动 模式", () => command("mode:" + (lastMode === "manual" ? "auto" : "manual"))]);
+    items.push({ label: "切换 自动/手动 模式", fn: () => command("mode:" + (lastMode === "manual" ? "auto" : "manual")) });
   }
-  items.push(["存档", async () => { await command("save:slot" + Date.now() % 1000); toastsEl.show("已存档", "ok"); }]);
-  items.push(["世界与存档…", () => $("worldsBtn").onclick()]);
+  items.push({ label: "存档", fn: async () => { await command("save:slot" + Date.now() % 1000); toastsEl.show("已存档", "ok"); } });
   if (state.phase === "playing") {
-    items.push(["调整大纲…", async () => {
+    items.push({ label: "调整大纲…", fn: async () => {
       const feedback = await confirmEl.ask("想怎么调整当前弧的大纲？", { input: true });
       if (feedback) command("outline:" + feedback);
-    }]);
+    } });
   }
-  items.push(["查看弧大纲", () => showFile("大纲/弧-01.md")]);
-  items.push(["查看经济体系", () => showFile("设定/经济.md")]);
-  items.push(["查看账本", () => showFile("记忆/账本.jsonl")]);
-  items.push(["查看判定日志", () => showFile("记忆/判定日志.jsonl")]);
-  items.push(["查看属性表", () => showFile("设定/属性.json")]);
-  items.push(["查看世界观", () => showFile("设定/世界观.md")]);
-  items.push(["查看伏笔台账", () => showFile("记忆/伏笔台账.json")]);
-  items.push(["重新开始", async () => { if (await confirmEl.ask("放弃当前故事，重新开始？")) command("restart"); }]);
-  return items.map(([label, fn]) => ({ label, fn }));
+  // —— 查看设定/记忆 ——
+  items.push({ sep: true });
+  items.push({ label: "查看 世界观", fn: () => showFile("设定/世界观.md") });
+  items.push({ label: "查看 伏笔台账", fn: () => showFile("记忆/伏笔台账.json") });
+  items.push({ label: "查看 经济设定", fn: () => showFile("设定/经济.md") });
+  items.push({ label: "查看 账本", fn: () => showFile("记忆/账本.jsonl") });
+  items.push({ label: "查看 判定日志", fn: () => showFile("记忆/判定日志.jsonl") });
+  items.push({ label: "查看 属性表", fn: () => showFile("设定/属性.json") });
+  items.push({ label: "查看 弧大纲", fn: () => showFile("大纲/弧-01.md") });
+  // —— 导出（整本下载）——
+  items.push({ sep: true });
+  items.push({ label: "导出 整本（TXT）", fn: () => downloadExport("txt") });
+  items.push({ label: "导出 整本（Markdown）", fn: () => downloadExport("md") });
+  items.push({ label: "导出 整本（HTML）", fn: () => downloadExport("html") });
+  // —— 危险操作 ——
+  items.push({ sep: true });
+  items.push({ label: "重新开始", fn: async () => { if (await confirmEl.ask("放弃当前故事，重新开始？")) command("restart"); } });
+  return items;
 }
 
 let lastMode = "manual";
@@ -648,7 +694,7 @@ async function loadSaveTree(worldId) {
   saveTreeEl.innerHTML = '<div class="st-head">存 档 树 · ' + worldId + '</div>';
   let saves = [];
   try {
-    saves = await fetch("/api/saves?session=" + encodeURIComponent(worldId), { headers: { authorization: "Bearer " + TOKEN } }).then((x) => x.json());
+    saves = await fetch(apiUrl("/api/saves", { session: worldId }), { headers: { authorization: "Bearer " + TOKEN } }).then((x) => x.json());
   } catch (e) { /* 静默 */ }
   if (!Array.isArray(saves)) saves = [];
   if (saves.length === 0) {
@@ -757,6 +803,16 @@ function applyProviderPreset(provider, overwrite) {
   $("setModelHint").textContent = d.modelHint;
 }
 
+/** 从界面收集 LLM 配置（保存与「测试连接」共用） */
+function collectLlm() {
+  return {
+    provider: $("setProvider").value,
+    baseUrl: $("setBaseUrl").value.trim(),
+    apiKey: $("setApiKey").value,
+    modelId: $("setModelId").value.trim(),
+  };
+}
+
 $("setProvider").onchange = () => applyProviderPreset($("setProvider").value, true);
 
 $("settingsBtn").onclick = async () => {
@@ -774,7 +830,8 @@ $("settingsBtn").onclick = async () => {
   $("setModelId").value = llm.modelId;
   $("setApiKey").value = ""; // 不回显明文
   fillRoleOverrides(llm);
-  $("setLan").textContent = location.origin + "/?token=" + s.token;
+  // 未设 WEB_TOKEN 时 token 为空串，不该展示无效的 ?token=
+  $("setLan").textContent = s.token ? location.origin + "/?token=" + s.token : location.origin + "/";
   $("setToken").textContent = s.token;
   settingsDlg.showModal();
 };
@@ -783,12 +840,7 @@ $("setSave").onclick = async () => {
   // 模式：与当前不同才发命令
   const wantMode = $("setMode").value;
   if (wantMode !== lastMode) await command("mode:" + wantMode);
-  const llm = {
-    provider: $("setProvider").value,
-    baseUrl: $("setBaseUrl").value.trim(),
-    apiKey: $("setApiKey").value,
-    modelId: $("setModelId").value.trim(),
-  };
+  const llm = collectLlm();
   const roles = collectRoleOverrides();
   if (roles) llm.roles = roles;
   const r = await api("/api/settings", {
@@ -802,12 +854,7 @@ $("setSave").onclick = async () => {
   settingsDlg.close();
 };
 $("setTest").onclick = async () => {
-  const llm = {
-    provider: $("setProvider").value,
-    baseUrl: $("setBaseUrl").value.trim(),
-    apiKey: $("setApiKey").value,
-    modelId: $("setModelId").value.trim(),
-  };
+  const llm = collectLlm();
   const btn = $("setTest");
   btn.disabled = true; const old = btn.textContent; btn.textContent = "测试中…";
   const r = await api("/api/llm-test", { llm });
@@ -818,7 +865,7 @@ $("setTest").onclick = async () => {
 
 // 导出：整本下载（只读，不落盘）——fetch 校验失败原因后走 blob 下载
 async function downloadExport(format) {
-  const link = "/api/export?format=" + format + "&session=" + encodeURIComponent(SESSION) + "&token=" + encodeURIComponent(TOKEN);
+  const link = apiUrl("/api/export", { format });
   const r = await fetch(link, { headers: { authorization: "Bearer " + TOKEN } });
   const ct = r.headers.get("content-type") || "";
   if (!r.ok || ct.includes("application/json")) {
@@ -843,7 +890,7 @@ $("exportMd").onclick = () => downloadExport("md");
 $("exportHtml").onclick = () => downloadExport("html");
 
 async function showFile(rel) {
-  const r = await api("/api/file?path=" + encodeURIComponent(rel) + "&token=" + encodeURIComponent(TOKEN));
+  const r = await api("/api/file?path=" + encodeURIComponent(rel));
   if (!r || r.ok === false) { toastsEl.show((r && r.message) || "读取失败", "err"); return; }
   if (!r.content) { newBlock("note", "「" + rel + "」尚未生成"); return; }
   const card = mountBlock(document.createElement("x-markdown"));
@@ -871,7 +918,7 @@ async function showFile(rel) {
   // 挂机兜底：playing 期间每 20s 轻量刷新大纲（文件读取很便宜）
   setInterval(() => { if (activeTab === "outline" && state.phase === "playing") refreshOutline(); }, 20000);
 
-  const es = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN) + "&session=" + encodeURIComponent(SESSION));
+  const es = new EventSource(apiUrl("/api/events")); // SSE 无法带请求头，token 只能走 query
   es.onmessage = (m) => {
     try {
       const ev = JSON.parse(m.data);

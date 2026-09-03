@@ -155,6 +155,7 @@
           }
           button:hover:not(:disabled), button:active:not(:disabled) { background: var(--line, #2a2a30); }
           button:disabled { color: var(--dim, #7a7770); cursor: default; }
+          .sep { height: 1px; background: var(--line, #2a2a30); margin: 5px 8px; }
           @keyframes rise { from { opacity: 0; transform: translateY(-4px); } }
         </style>
         <div class="panel"></div>`;
@@ -166,6 +167,12 @@
       const panel = this.shadowRoot.querySelector(".panel");
       panel.innerHTML = "";
       this._items.forEach((it) => {
+        if (it.sep) {
+          const hr = document.createElement("div");
+          hr.className = "sep";
+          panel.appendChild(hr);
+          return;
+        }
         const b = document.createElement("button");
         b.textContent = it.label;
         b.disabled = !!it.disabled;

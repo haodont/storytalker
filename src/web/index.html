@@ -68,6 +68,12 @@
   }
   header button:hover { color: var(--ink); border-color: var(--line-strong); background: var(--panel2); }
   header button.sm { padding: 6px 9px; font-size: 12px; min-width: 32px; }
+  /* 字号分段控件：两个按钮连成一组，仅中间分隔线 */
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; min-width: 28px; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  /* 激活态：当前处于「开」的切换类按钮（如过程面板已展开） */
+  header button.active { color: var(--ink); border-color: var(--accent); background: var(--panel2); }
 
   /* =====================================================================
      4. 布局 —— 阅读主列 + 过程面板（桌面右侧常驻，移动端抽屉）
@@ -329,17 +335,21 @@
     <button id="stopBtn" class="sm danger" title="中断当前生成" style="display:none">■ 停止</button>
   </div>
   <div class="hgroups">
+    <!-- 视图：字号 / 主题 / 过程面板 -->
     <div class="hgroup">
-      <button id="fontMinus" class="sm" title="减小正文字号">A-</button>
-      <button id="fontPlus" class="sm" title="增大正文字号">A+</button>
-      <button id="themeBtn" class="sm" title="切换 夜间/纸质 主题">纸</button>
-      <button id="settingsBtn" class="sm" title="设置">⚙</button>
-      <button id="worldsBtn" class="sm" title="世界与存档">世界</button>
+      <div class="seg" role="group" aria-label="正文字号">
+        <button id="fontMinus" class="sm" title="减小正文字号" aria-label="减小字号">A-</button>
+        <button id="fontPlus" class="sm" title="增大正文字号" aria-label="增大字号">A+</button>
+      </div>
+      <button id="themeBtn" class="sm" title="切换 夜间/纸质 主题">夜间</button>
+      <button id="procToggle" class="sm" title="过程面板">过程</button>
     </div>
     <span class="hsep"></span>
+    <!-- 会话：世界 / 设置 / 更多 -->
     <div class="hgroup">
-      <button id="procToggle" title="过程面板">过程</button>
-      <button id="menuBtn" title="菜单">菜单</button>
+      <button id="worldsBtn" class="sm" title="世界与存档">世界</button>
+      <button id="settingsBtn" class="sm" title="设置">⚙</button>
+      <button id="menuBtn" title="更多操作">菜单</button>
     </div>
   </div>
   <x-menu id="menu"></x-menu>
