@@ -324,7 +324,7 @@ export class WebHub {
 			// 开局模板多轮对话
 			// 「开始」= 模板完成，进入设计；「修改 字段=值」= 修改模板字段
 			const startMatch = text.match(/^开始$/);
-			const modifyMatch = text.match(/^修改\s+(\w+)\s*[=：]\s*(.+)$/);
+			const modifyMatch = text.match(/^修改\s+([\w一-鿿]+)\s*[=：]\s*(.+)$/);
 			if (startMatch) {
 				this.run(this.engine.buildFromPremise(), "开局设计");
 			} else if (modifyMatch && modifyMatch[1] && modifyMatch[2]) {
@@ -371,6 +371,16 @@ export class WebHub {
 			case "build":
 				await this.engine.buildFromIdea();
 				return { ok: true };
+			case "premise": {
+				// 开局模板多轮对话的 Web 入口：empty 阶段的自由输入被 handleInput 路由到灵感对话，
+				// 而 chatPremise 只在 phase 已是 premise_chat 时被调用 → 无此命令将永远无法进入模板流程。
+				const phase = this.engine.gameState.phase;
+				if (phase !== "empty" && phase !== "premise_chat") {
+					return { ok: false, message: `开局模板仅在开始前可用（当前阶段：${phase}）` };
+				}
+				await this.engine.chatPremise(arg || "");
+				return { ok: true };
+			}
 			case "load":
 				await this.engine.load(arg || "");
 				return { ok: true };
@@ -398,7 +408,8 @@ export function startWebServer(sessions: SessionManager, port: number): Promise<
 	});
 	return new Promise((resolve) => {
 		server.listen(port, "0.0.0.0", () => {
-			console.log(`Web 服务已启动: http://0.0.0.0:${port}/`);
+			// 提示可点击地址：浏览器无法直连 0.0.0.0，需用 127.0.0.1/localhost（局域网可用本机 IP）
+			console.log(`Web 服务已启动: http://127.0.0.1:${port}/  (局域网: http://<本机IP>:${port}/)`);
 			resolve();
 		});
 	});

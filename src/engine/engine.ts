@@ -8,6 +8,7 @@ import { createLlm, specFromSettings, type Llm } from "../llm.js";
 import { assembleArcPlanPrompt, assembleBootPrompt, assembleDirectorReportPrompt, assembleMemoryDistillPrompt, assembleArcDistillPrompt, assembleOutlineDerivationPrompt, assembleOutlineReviewPrompt, assembleReviewerPrompt, assembleWriterPrompt, draftPrecheckNotes, extractCurrency } from "./context.js";
 import { applyCharacterPatches, applyEntityPatches, applyForeshadowOps, applyTransactions, sanitizeReport } from "./settle.js";
 import { detectRepetitionLoop, designIssues, outlineCastNote, outlineGateHard, outlineGateNotes, sanitizeDesign } from "./validate.js";
+import { phaseViolation, type Phase } from "./phase-gate.js";
 import { initialState as initialGameState, normalizeState } from "./state.js";
 import { setActiveContextWindow } from "./context.js";
 
@@ -126,6 +127,18 @@ export class Engine {
 		await this.commit();
 	}
 
+	/**
+	 * 阶段门禁：越阶段调用时上报 error 事件并返回 false，**绝不静默 return**。
+	 * 静默失败正是「开局模板流程在 Web 端完全不可达」这类 P0 的温床——
+	 * 调用方路由与引擎门禁互锁时，整条功能链变成死代码却无任何反馈。
+	 */
+	private gate(allowed: readonly Phase[], action: string): boolean {
+		const why = phaseViolation(this.state.phase, allowed, action);
+		if (!why) return true;
+		this.emit({ type: "error", message: why });
+		return false;
+	}
+
 	/** 后台执行并兜底错误（引擎事件流对外只发 error 事件） */
 	private void(p: Promise<void>): void {
 		p.catch((err) => {
@@ -204,6 +217,10 @@ export class Engine {
 				this.emit({ type: "status", text: "开局设计待确认：输入 /accept 开始，或直接输入修改意见。" });
 			} else if (saved.phase === "arc_boundary") {
 				this.void(this.runArcBoundary());
+			} else if (saved.phase === "premise_chat") {
+				// 模板对话仅在内存（template 未持久化），刷新/重启无法真恢复 → 退回空局重填
+				await this.setPhase("empty");
+				this.emit({ type: "status", text: "上次的开局模板未完成（模板数据未保存），已重置。重新点击菜单「用模板开局」开始。" });
 			} else if (saved.phase === "idea_chat") {
 				for (const m of saved.ideaMsgs ?? []) {
 					this.emit(m.role === "user" ? { type: "idea_user", text: m.text } : { type: "idea_done", text: m.text });
@@ -302,7 +319,7 @@ export class Engine {
 
 	/** 灵感酝酿阶段：与导播多轮对话打磨题材，不触发正式设计 */
 	async chatIdea(text: string): Promise<void> {
-		if (this.state.phase !== "empty" && this.state.phase !== "idea_chat") return;
+		if (!this.gate(["empty", "idea_chat"], "灵感对话")) return;
 		if (this.ideaBusy) {
 			this.emit({ type: "status", text: "导播正在回复，稍等它说完……" });
 			return;
@@ -363,7 +380,7 @@ export class Engine {
 
 	/** 多轮对话收集开局模板：逐字段引导，直到模板完成 */
 	async chatPremise(text: string): Promise<void> {
-		if (this.state.phase !== "empty" && this.state.phase !== "premise_chat") return;
+		if (!this.gate(["empty", "premise_chat"], "模板对话")) return;
 		if (this.premiseBusy) {
 			this.emit({ type: "status", text: "导播正在回复，稍等它说完……" });
 			return;
@@ -383,6 +400,7 @@ export class Engine {
 
 			// 记录用户回答
 			this.premiseMsgs.push({ role: "user", text });
+			this.emit({ type: "idea_user", text });
 
 			// 尝试从回答中提取当前字段的值
 			const currentField = Engine.TEMPLATE_FIELDS[this.templateFieldIndex];
@@ -432,7 +450,7 @@ export class Engine {
 
 	/** 从模板构建开局：将模板转为结构化描述，传给 Director 设计 */
 	async buildFromPremise(): Promise<void> {
-		if (this.state.phase !== "premise_chat") return;
+		if (!this.gate(["premise_chat"], "从模板构建开局")) return;
 
 		// 检查模板是否完整
 		const requiredFields = Engine.TEMPLATE_FIELDS;
@@ -472,13 +490,13 @@ export class Engine {
 
 	/** 模板修改：允许用户直接修改模板字段 */
 	async modifyTemplate(field: string, value: string): Promise<void> {
-		if (this.state.phase !== "premise_chat") return;
-		const validField = Engine.TEMPLATE_FIELDS.find((f) => f.key === field);
+		if (!this.gate(["premise_chat"], "修改模板")) return;
+		const validField = Engine.TEMPLATE_FIELDS.find((f) => f.key === field || f.label === field || f.label.includes(field) || field.includes(f.label));
 		if (!validField) {
 			this.emit({ type: "error", message: `未知字段：${field}。可修改字段：${Engine.TEMPLATE_FIELDS.map((f) => f.key).join("、")}` });
 			return;
 		}
-		(this.template as any)[field] = value.trim();
+		(this.template as any)[validField.key] = value.trim();
 		const confirmMsg = `已更新「${validField.label}」：${value.trim()}`;
 		this.emit({ type: "status", text: confirmMsg });
 		await this.commit();
@@ -486,7 +504,7 @@ export class Engine {
 
 	/** 结束酝酿，把积累的对话交给导播正式设计开局 */
 	async buildFromIdea(extra?: string): Promise<void> {
-		if (this.state.phase !== "empty" && this.state.phase !== "idea_chat") return;
+		if (!this.gate(["empty", "idea_chat"], "构建开局")) return;
 		const parts = this.state.ideaMsgs.filter((m) => m.role === "user").map((m) => m.text);
 		if (extra && extra.trim()) parts.push(extra.trim());
 		if (parts.length === 0) {
@@ -528,7 +546,7 @@ export class Engine {
 	}
 
 	async startPremise(premise: string): Promise<void> {
-		if (this.state.phase !== "empty" && this.state.phase !== "idea_chat") return;
+		if (!this.gate(["empty", "idea_chat", "premise_chat"], "开始故事")) return;
 		this.state.premise = premise;
 		// 新故事 → 生成唯一 storyId（决定独立存档文件名）
 		if (!this.state.storyId) {
@@ -572,7 +590,7 @@ export class Engine {
 
 	/** confirm_bible 阶段：接受开局或按意见重设计 */
 	async confirmBible(feedback?: string): Promise<void> {
-		if (this.state.phase !== "confirm_bible") return;
+		if (!this.gate(["confirm_bible"], "确认开局")) return;
 		if (!feedback) {
 			this.emit({ type: "status", text: "开局确认，故事开始。" });
 			await this.beginArc(1);
